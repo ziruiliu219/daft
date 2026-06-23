@@ -12,5 +12,9 @@
   ],
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
-  "makefile.configureOnOpen": false
+  "makefile.configureOnOpen": false,
+  "cmake.sourceDirectory": "/Users/ziruiliu/Daft/examples/hello_cpp",
+  "rust-analyzer.server.path": "/opt/homebrew/bin/rust-analyzer",
+  "rust-analyzer.procMacro.enable": true
+
 }
