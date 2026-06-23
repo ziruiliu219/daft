@@ -3220,6 +3220,7 @@ dependencies = [
  "common-arrow-ffi",
  "common-error",
  "common-runtime",
+ "daft-algebra",
  "daft-core",
  "daft-dsl",
  "daft-io",

@@ -15,6 +15,7 @@ use chunk_source::{
 use common_error::DaftResult;
 use common_runtime::{JoinSet, get_compute_runtime};
 use daft_core::prelude::*;
+use daft_algebra::boolean::split_conjunction;
 use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_columns};
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, stream::BoxStream};
@@ -471,12 +472,116 @@ fn build_page_level_selection(
     Some(RowSelection::from(selectors))
 }
 
+/// A single stage in staged predicate evaluation. Each stage groups one or
+/// more conjuncts that reference the same set of columns. Stages are evaluated
+/// in order; each stage's `RowSelection` output feeds into the next stage's
+/// column decoders so later stages only decode rows that survived earlier ones.
+struct PredicateStage {
+    /// Physical Parquet column indices to decode in this stage.
+    col_indices: Vec<usize>,
+    /// The combined sub-predicate for this stage (conjuncts AND-ed together).
+    predicate: ExprRef,
+}
+
+/// Partition the predicate into stages for lazy/staged evaluation.
+///
+/// Splits the predicate into AND conjuncts, groups them by the set of columns
+/// they reference, and returns one `PredicateStage` per group. Conjuncts that
+/// reference fewer columns come first (heuristic: simpler predicates are more
+/// selective and cheaper to evaluate). Within a tie, original order is preserved.
+///
+/// If the predicate cannot be split (single conjunct or all conjuncts reference
+/// the same columns), returns a single stage covering all pred columns — this
+/// degenerates to the previous all-at-once behavior with zero overhead.
+fn build_predicate_stages(
+    predicate: &ExprRef,
+    pred_col_indices: &[usize],
+    arrow_schema: &ArrowSchema,
+) -> Vec<PredicateStage> {
+    use daft_algebra::boolean::combine_conjunction;
+
+    let conjuncts = split_conjunction(predicate);
+    if conjuncts.len() <= 1 {
+        // Single conjunct → single stage, no splitting overhead.
+        return vec![PredicateStage {
+            col_indices: pred_col_indices.to_vec(),
+            predicate: predicate.clone(),
+        }];
+    }
+
+    // Map arrow field name → physical column index for pred columns.
+    let name_to_idx: std::collections::HashMap<&str, usize> = pred_col_indices
+        .iter()
+        .map(|&i| (arrow_schema.field(i).name().as_str(), i))
+        .collect();
+
+    // For each conjunct, determine which physical column indices it needs.
+    struct TaggedConjunct {
+        expr: ExprRef,
+        col_indices: Vec<usize>,
+    }
+
+    let tagged: Vec<TaggedConjunct> = conjuncts
+        .into_iter()
+        .map(|expr| {
+            let cols = get_required_columns(&expr);
+            let mut col_indices: Vec<usize> = cols
+                .iter()
+                .filter_map(|name| name_to_idx.get(name.as_str()).copied())
+                .collect();
+            col_indices.sort_unstable();
+            col_indices.dedup();
+            TaggedConjunct {
+                expr,
+                col_indices,
+            }
+        })
+        .collect();
+
+    // Group conjuncts that share the exact same column set into one stage.
+    // Use a BTreeMap keyed by sorted col_indices to get deterministic ordering.
+    let mut groups: std::collections::BTreeMap<Vec<usize>, Vec<&TaggedConjunct>> =
+        std::collections::BTreeMap::new();
+    for tc in &tagged {
+        groups.entry(tc.col_indices.clone()).or_default().push(tc);
+    }
+
+    // Sort stages: fewer columns first (cheaper/more-selective heuristic),
+    // tie-break by earliest conjunct order in the original expression.
+    let mut stages: Vec<PredicateStage> = groups
+        .into_iter()
+        .map(|(col_indices, conjuncts)| {
+            let combined = combine_conjunction(conjuncts.iter().map(|c| c.expr.clone()))
+                .expect("non-empty conjunct group");
+            PredicateStage {
+                col_indices,
+                predicate: combined,
+            }
+        })
+        .collect();
+
+    // Stable sort by number of columns (fewer first).
+    stages.sort_by_key(|s| s.col_indices.len());
+
+    // If all stages collapsed into one with the same columns as the full pred,
+    // just return the original predicate to avoid any expression reconstruction.
+    if stages.len() == 1 {
+        stages[0].predicate = predicate.clone();
+        stages[0].col_indices = pred_col_indices.to_vec();
+    }
+
+    stages
+}
+
 /// Build the per-RG input bundles for the streaming decoder.
 ///
 /// Without a pushed predicate prefilter, this just forwards offset/delete/limit
-/// selections. With one, it first decodes predicate columns, evaluates the mask,
-/// and uses that same mask for both filtered predicate arrays and a data-column
-/// `RowSelection`.
+/// selections. With a predicate, uses **staged evaluation**: the predicate is
+/// split into AND conjuncts grouped by column. Each stage decodes only its
+/// columns, evaluates its sub-predicate, and produces a refined `RowSelection`
+/// passed to the next stage. Later stages decode only the rows that survived
+/// earlier stages — saving decode cost on low-selectivity filters over unsorted
+/// data.
 #[allow(clippy::too_many_arguments)]
 async fn build_rg_inputs(
     chunk_source: &Arc<ChunkSource>,
@@ -508,8 +613,13 @@ async fn build_rg_inputs(
         Some(_) => opts.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
         None => usize::MAX,
     };
+
+    // Build stages for staged predicate evaluation.
+    let stages = build_predicate_stages(prefilter_predicate, &plan.pred_col_indices, arrow_schema);
+    let is_single_stage = stages.len() == 1;
+
+    // Full pred schema/bound for page-level skip (still uses all pred cols).
     let pred_arrow_schema = schema_from_indices(arrow_schema, &plan.pred_col_indices);
-    // Bind predicate once across all RGs — same chunk schema everywhere.
     let chunk_daft_schema = Arc::new(Schema::try_from(pred_arrow_schema.as_ref())?);
     let bound_pred = BoundExpr::try_new(
         substitute_missing_cols(prefilter_predicate, &chunk_daft_schema)?,
@@ -524,7 +634,7 @@ async fn build_rg_inputs(
             break;
         }
 
-        // Try to refine the base selection with page-level skip
+        // Try to refine the base selection with page-level skip (uses full predicate).
         let page_sel = build_page_level_selection(
             metadata,
             rg_idx,
@@ -535,27 +645,224 @@ async fn build_rg_inputs(
         );
         let effective_sel = combine_selections(base_sel.clone(), page_sel);
 
-        // total_selected = number of rows that the decoder will actually output
-        // (i.e., the sum of select segments in effective_sel, not the total RG rows)
-        let total_selected = match &effective_sel {
+        let rg_rows = metadata.row_group(rg_idx).num_rows() as usize;
+
+        if is_single_stage {
+            // ── Fast path: single stage, same as old behavior ──
+            let (rg_inputs, rows_selected) = build_rg_inputs_single_stage(
+                chunk_source,
+                metadata,
+                arrow_schema,
+                rg_idx,
+                rg_rows,
+                &plan.pred_col_indices,
+                &pred_arrow_schema,
+                &bound_pred,
+                effective_sel,
+                chunk_size,
+                selected_rows_remaining,
+                path,
+            )
+            .await?;
+            selected_rows_remaining -= rows_selected;
+            out.push(rg_inputs);
+        } else {
+            // ── Staged evaluation: evaluate stages sequentially ──
+            let (rg_inputs, rows_selected) = build_rg_inputs_staged(
+                chunk_source,
+                metadata,
+                arrow_schema,
+                rg_idx,
+                rg_rows,
+                &stages,
+                &plan.pred_col_indices,
+                &pred_arrow_schema,
+                &bound_pred,
+                effective_sel,
+                chunk_size,
+                selected_rows_remaining,
+                path,
+            )
+            .await?;
+            selected_rows_remaining -= rows_selected;
+            out.push(rg_inputs);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Single-stage RG processing (original algorithm). Used when the predicate
+/// cannot be decomposed into multiple independent column groups.
+#[allow(clippy::too_many_arguments)]
+async fn build_rg_inputs_single_stage(
+    chunk_source: &Arc<ChunkSource>,
+    metadata: &Arc<ParquetMetaData>,
+    arrow_schema: &Arc<ArrowSchema>,
+    rg_idx: usize,
+    rg_rows: usize,
+    pred_col_indices: &[usize],
+    pred_arrow_schema: &Arc<ArrowSchema>,
+    bound_pred: &BoundExpr,
+    effective_sel: Option<RowSelection>,
+    chunk_size: usize,
+    mut selected_rows_remaining: usize,
+    path: &Arc<str>,
+) -> DaftResult<(RgInputs, usize)> {
+    let total_selected = match &effective_sel {
+        Some(s) => s.iter().filter(|sel| !sel.skip).map(|sel| sel.row_count).sum(),
+        None => rg_rows,
+    };
+
+    let (mut col_receivers, _col_handles) = spawn_col_decoders(
+        pred_col_indices,
+        chunk_source,
+        metadata,
+        arrow_schema,
+        effective_sel.as_ref(),
+        rg_idx,
+        chunk_size,
+        path,
+    )
+    .await?;
+
+    let mut predicate_selectors: Vec<RowSelector> = Vec::new();
+    let mut filtered_pred_by_col: Vec<Vec<ArrayRef>> = (0..pred_col_indices.len())
+        .map(|_| Vec::new())
+        .collect();
+    let mut processed_rows = 0usize;
+    let initial_remaining = selected_rows_remaining;
+
+    loop {
+        let Some(chunks) = recv_one_chunk(&mut col_receivers).await? else {
+            break;
+        };
+        let chunk_rows = chunks[0].len();
+        let daft_pred =
+            record_batch_from_arrow(pred_arrow_schema.clone(), chunks.clone(), path.as_ref())?;
+        let mask = eval_predicate_mask(&daft_pred, bound_pred)?;
+
+        let selected_rows = mask.true_count();
+        let (mask, selected_rows) = if selected_rows > selected_rows_remaining {
+            (
+                truncate_mask_to_n_trues(&mask, selected_rows_remaining),
+                selected_rows_remaining,
+            )
+        } else {
+            (mask, selected_rows)
+        };
+
+        let filtered = filter_arrays_by_mask(&chunks, &mask, path.as_ref())?;
+        for (col_pos, filtered) in filtered.into_iter().enumerate() {
+            filtered_pred_by_col[col_pos].push(filtered);
+        }
+        predicate_selectors.extend(bool_array_to_row_selection(&mask).iter().copied());
+        processed_rows += chunk_rows;
+        selected_rows_remaining -= selected_rows;
+        if selected_rows_remaining == 0 {
+            break;
+        }
+    }
+    drop(col_receivers);
+
+    let pred_arrays: Vec<ArrayRef> = pred_col_indices
+        .iter()
+        .enumerate()
+        .map(|(col_pos, &col_idx)| {
+            let chunks = &filtered_pred_by_col[col_pos];
+            if chunks.is_empty() {
+                arrow::array::new_empty_array(arrow_schema.field(col_idx).data_type())
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    chunks.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).expect("concat per-col chunks")
+            }
+        })
+        .collect();
+
+    let unprocessed = total_selected - processed_rows;
+    if unprocessed > 0 {
+        predicate_selectors.push(RowSelector::skip(unprocessed));
+    }
+    let pred_sel = RowSelection::from(predicate_selectors);
+    let selection = Some(match &effective_sel {
+        Some(eff) => refine_selection(eff, &pred_sel),
+        None => pred_sel,
+    });
+
+    let rows_consumed = initial_remaining - selected_rows_remaining;
+    Ok((RgInputs { selection, pred_arrays }, rows_consumed))
+}
+
+/// Multi-stage RG processing. Evaluates predicate stages sequentially:
+/// stage 0 decodes its columns using `effective_sel`, evaluates its sub-pred,
+/// produces a `RowSelection`; stage 1 decodes using that refined selection, etc.
+/// Final output combines all stages' filtered arrays.
+#[allow(clippy::too_many_arguments)]
+async fn build_rg_inputs_staged(
+    chunk_source: &Arc<ChunkSource>,
+    metadata: &Arc<ParquetMetaData>,
+    arrow_schema: &Arc<ArrowSchema>,
+    rg_idx: usize,
+    rg_rows: usize,
+    stages: &[PredicateStage],
+    all_pred_col_indices: &[usize],
+    _pred_arrow_schema: &Arc<ArrowSchema>,
+    _full_bound_pred: &BoundExpr,
+    effective_sel: Option<RowSelection>,
+    chunk_size: usize,
+    mut selected_rows_remaining: usize,
+    path: &Arc<str>,
+) -> DaftResult<(RgInputs, usize)> {
+    let initial_remaining = selected_rows_remaining;
+
+    // Track the running RowSelection relative to the full RG. Starts from
+    // effective_sel (page-level + offset/delete) and gets refined each stage.
+    let mut current_sel_absolute = effective_sel.clone();
+
+    // Accumulate filtered arrays per physical pred column across all stages.
+    // Index maps: physical_col_idx → position in all_pred_col_indices.
+    let col_idx_to_pos: std::collections::HashMap<usize, usize> = all_pred_col_indices
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| (idx, pos))
+        .collect();
+    let mut filtered_pred_by_col: Vec<Vec<ArrayRef>> = (0..all_pred_col_indices.len())
+        .map(|_| Vec::new())
+        .collect();
+
+    for stage in stages {
+        if selected_rows_remaining == 0 {
+            break;
+        }
+
+        let stage_arrow_schema = schema_from_indices(arrow_schema, &stage.col_indices);
+        let stage_daft_schema = Arc::new(Schema::try_from(stage_arrow_schema.as_ref())?);
+        let stage_bound = BoundExpr::try_new(
+            substitute_missing_cols(&stage.predicate, &stage_daft_schema)?,
+            &stage_daft_schema,
+        )?;
+
+        // Decode this stage's columns using the current (refined) selection.
+        let total_selected: usize = match &current_sel_absolute {
             Some(s) => s.iter().filter(|sel| !sel.skip).map(|sel| sel.row_count).sum(),
-            None => metadata.row_group(rg_idx).num_rows() as usize,
+            None => rg_rows,
         };
 
         let (mut col_receivers, _col_handles) = spawn_col_decoders(
-            &plan.pred_col_indices,
+            &stage.col_indices,
             chunk_source,
             metadata,
             arrow_schema,
-            effective_sel.as_ref(),
+            current_sel_absolute.as_ref(),
             rg_idx,
             chunk_size,
             path,
         )
         .await?;
 
-        let mut predicate_selectors: Vec<RowSelector> = Vec::new();
-        let mut filtered_pred_by_col: Vec<Vec<ArrayRef>> = (0..plan.pred_col_indices.len())
+        let mut stage_selectors: Vec<RowSelector> = Vec::new();
+        let mut stage_filtered_by_col: Vec<Vec<ArrayRef>> = (0..stage.col_indices.len())
             .map(|_| Vec::new())
             .collect();
         let mut processed_rows = 0usize;
@@ -565,9 +872,12 @@ async fn build_rg_inputs(
                 break;
             };
             let chunk_rows = chunks[0].len();
-            let daft_pred =
-                record_batch_from_arrow(pred_arrow_schema.clone(), chunks.clone(), path.as_ref())?;
-            let mask = eval_predicate_mask(&daft_pred, &bound_pred)?;
+            let batch = record_batch_from_arrow(
+                stage_arrow_schema.clone(),
+                chunks.clone(),
+                path.as_ref(),
+            )?;
+            let mask = eval_predicate_mask(&batch, &stage_bound)?;
 
             let selected_rows = mask.true_count();
             let (mask, selected_rows) = if selected_rows > selected_rows_remaining {
@@ -580,55 +890,99 @@ async fn build_rg_inputs(
             };
 
             let filtered = filter_arrays_by_mask(&chunks, &mask, path.as_ref())?;
-            for (col_pos, filtered) in filtered.into_iter().enumerate() {
-                filtered_pred_by_col[col_pos].push(filtered);
+            for (col_pos, arr) in filtered.into_iter().enumerate() {
+                stage_filtered_by_col[col_pos].push(arr);
             }
-            predicate_selectors.extend(bool_array_to_row_selection(&mask).iter().copied());
+            stage_selectors.extend(bool_array_to_row_selection(&mask).iter().copied());
             processed_rows += chunk_rows;
             selected_rows_remaining -= selected_rows;
             if selected_rows_remaining == 0 {
                 break;
             }
         }
-        // Dropping receivers closes the channels → spawned decoders abort.
         drop(col_receivers);
 
-        // Concat per-col filtered chunks into one ArrayRef per col. Zero rows
-        // processed (e.g. base_sel selected 0 rows) → empty array of the col's
-        // data type.
-        let pred_arrays: Vec<ArrayRef> = plan
-            .pred_col_indices
-            .iter()
-            .enumerate()
-            .map(|(col_pos, &col_idx)| {
-                let chunks = &filtered_pred_by_col[col_pos];
-                if chunks.is_empty() {
-                    arrow::array::new_empty_array(arrow_schema.field(col_idx).data_type())
-                } else {
-                    let refs: Vec<&dyn arrow::array::Array> =
-                        chunks.iter().map(|a| a.as_ref()).collect();
-                    arrow::compute::concat(&refs).expect("concat per-col chunks")
-                }
-            })
-            .collect();
-
+        // Handle unprocessed rows (early exit due to limit).
         let unprocessed = total_selected - processed_rows;
         if unprocessed > 0 {
-            predicate_selectors.push(RowSelector::skip(unprocessed));
+            stage_selectors.push(RowSelector::skip(unprocessed));
         }
-        let pred_sel = RowSelection::from(predicate_selectors);
-        let selection = Some(match &effective_sel {
-            Some(eff) => refine_selection(eff, &pred_sel),
-            None => pred_sel,
-        });
 
-        out.push(RgInputs {
-            selection,
-            pred_arrays,
+        // Build a combined boolean mask for this stage (used to re-filter
+        // previously-accumulated pred columns from earlier stages).
+        // The stage_selectors encode select/skip relative to the rows this
+        // stage received. We need a flat BooleanArray of the same length.
+        let stage_mask_len: usize = stage_selectors.iter().map(|s| s.row_count).sum();
+        let stage_mask: arrow::array::BooleanArray = {
+            let mut bits = Vec::with_capacity(stage_mask_len);
+            for sel in &stage_selectors {
+                bits.extend(std::iter::repeat(!sel.skip).take(sel.row_count));
+            }
+            bits.into()
+        };
+
+        // Re-filter previously accumulated pred columns from earlier stages.
+        // Those arrays have `stage_mask_len` rows (same rows this stage decoded).
+        // After filtering, they'll have only the rows that this stage kept.
+        for col_chunks in filtered_pred_by_col.iter_mut() {
+            if col_chunks.is_empty() {
+                continue;
+            }
+            // Concat → filter → replace
+            let refs: Vec<&dyn arrow::array::Array> =
+                col_chunks.iter().map(|a| a.as_ref()).collect();
+            let combined = arrow::compute::concat(&refs).expect("concat pred col");
+            if combined.len() == stage_mask_len {
+                let filtered = arrow::compute::filter(&combined, &stage_mask)
+                    .expect("filter pred col by stage mask");
+                col_chunks.clear();
+                col_chunks.push(filtered);
+            }
+            // If lengths don't match (shouldn't happen), leave as-is.
+        }
+
+        // Store this stage's filtered arrays into the global pred_arrays accumulator.
+        for (stage_col_pos, &phys_col_idx) in stage.col_indices.iter().enumerate() {
+            if let Some(&global_pos) = col_idx_to_pos.get(&phys_col_idx) {
+                filtered_pred_by_col[global_pos]
+                    .extend(stage_filtered_by_col[stage_col_pos].drain(..));
+            }
+        }
+
+        // Refine the absolute selection for the next stage.
+        let stage_pred_sel = RowSelection::from(stage_selectors);
+        current_sel_absolute = Some(match &current_sel_absolute {
+            Some(abs) => refine_selection(abs, &stage_pred_sel),
+            None => stage_pred_sel,
         });
     }
 
-    Ok(out)
+    // Build final pred_arrays: concat per-column filtered chunks.
+    let pred_arrays: Vec<ArrayRef> = all_pred_col_indices
+        .iter()
+        .enumerate()
+        .map(|(col_pos, &col_idx)| {
+            let chunks = &filtered_pred_by_col[col_pos];
+            if chunks.is_empty() {
+                arrow::array::new_empty_array(arrow_schema.field(col_idx).data_type())
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    chunks.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).expect("concat per-col chunks")
+            }
+        })
+        .collect();
+
+    // The final selection for data columns is current_sel_absolute (already
+    // absolute to the RG).
+    let rows_consumed = initial_remaining - selected_rows_remaining;
+    Ok((
+        RgInputs {
+            selection: current_sel_absolute,
+            pred_arrays,
+        },
+        rows_consumed,
+    ))
 }
 
 /// Shared per-file state for an RG-decoding task. One `Arc<RgTaskCtx>` is
