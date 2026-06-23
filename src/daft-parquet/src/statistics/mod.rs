@@ -3,7 +3,7 @@ use std::string::FromUtf8Error;
 use common_error::DaftError;
 use snafu::Snafu;
 
-mod column_range;
+pub(crate) mod column_range;
 mod table_stats;
 mod utils;
 pub use table_stats::row_group_metadata_to_table_stats;

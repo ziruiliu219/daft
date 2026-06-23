@@ -42,7 +42,9 @@ use crate::{
         apply_field_ids_to_arrowrs_parquet_metadata, strip_string_types_from_parquet_metadata,
     },
     read::{ParquetReadOptions, ParquetSchemaInferenceOptions, StringEncoding},
+    statistics::column_range::parquet_statistics_to_column_range_statistics,
 };
+use daft_stats::{ColumnRangeStatistics, TableStatistics, TruthValue};
 
 pub enum ParquetSource<'a> {
     Local {
@@ -314,6 +316,161 @@ struct RgInputs {
     pred_arrays: Vec<ArrayRef>,
 }
 
+/// Attempt to build a page-level RowSelection using Column Index min/max stats.
+///
+/// For each page in the given RG, evaluates the predicate against the page's
+/// min/max statistics. Pages where the predicate is provably False are marked
+/// as skip. Returns None if column index is unavailable or stats cannot be
+/// interpreted, in which case the caller falls back to reading all pages.
+///
+/// This only reduces the set of pages that Phase 1 (predicate column decode)
+/// needs to decompress — it does NOT replace per-row filter evaluation.
+fn build_page_level_selection(
+    metadata: &ParquetMetaData,
+    rg_idx: usize,
+    pred_col_indices: &[usize],
+    arrow_schema: &ArrowSchema,
+    daft_schema: &Schema,
+    bound_pred: &BoundExpr,
+) -> Option<RowSelection> {
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
+
+    // Need both column index and offset index
+    let column_index = metadata.column_index()?;
+    let offset_index = metadata.offset_index()?;
+
+    let rg_col_index = column_index.get(rg_idx)?;
+    let rg_off_index = offset_index.get(rg_idx)?;
+
+    // Use the first pred column to determine page count and row counts.
+    let first_pred_col = *pred_col_indices.first()?;
+    let page_locations = &rg_off_index.get(first_pred_col)?.page_locations;
+    let num_pages: usize = page_locations.len();
+    if num_pages == 0 {
+        return None;
+    }
+
+    let rg_total_rows = metadata.row_group(rg_idx).num_rows() as usize;
+
+    // Compute per-page row counts from first_row_index differences
+    let page_row_counts: Vec<usize> = (0..num_pages)
+        .map(|p| {
+            if p + 1 < num_pages {
+                (page_locations[p + 1].first_row_index - page_locations[p].first_row_index) as usize
+            } else {
+                rg_total_rows - page_locations[p].first_row_index as usize
+            }
+        })
+        .collect();
+
+    let schema_descr = metadata.file_metadata().schema_descr();
+    let mut selectors: Vec<RowSelector> = Vec::with_capacity(num_pages);
+
+    for page_idx in 0..num_pages {
+        let mut all_col_stats: Vec<ColumnRangeStatistics> = Vec::with_capacity(pred_col_indices.len());
+        let mut can_evaluate = true;
+
+        for &col_idx in pred_col_indices {
+            let col_page_index = match rg_col_index.get(col_idx) {
+                Some(idx) => idx,
+                None => { can_evaluate = false; break; }
+            };
+
+            // Null page: all values are null, predicate likely evaluates to NULL/unknown
+            if col_page_index.is_null_page(page_idx) {
+                all_col_stats.push(ColumnRangeStatistics::Missing);
+                continue;
+            }
+
+            let col_descr = schema_descr.column(col_idx);
+            let daft_field = match daft_schema.get_field(arrow_schema.field(col_idx).name()) {
+                Ok(f) => f,
+                Err(_) => { can_evaluate = false; break; }
+            };
+
+            // Extract typed min/max from ColumnIndexMetaData and build Statistics
+            let stats = match col_page_index {
+                ColumnIndexMetaData::INT32(idx) => {
+                    let min = idx.min_values_iter().nth(page_idx).flatten().copied();
+                    let max = idx.max_values_iter().nth(page_idx).flatten().copied();
+                    match (min, max) {
+                        (Some(mn), Some(mx)) => parquet::file::statistics::Statistics::int32(Some(mn), Some(mx), None, Some(0), false),
+                        _ => { can_evaluate = false; break; }
+                    }
+                }
+                ColumnIndexMetaData::INT64(idx) => {
+                    let min = idx.min_values_iter().nth(page_idx).flatten().copied();
+                    let max = idx.max_values_iter().nth(page_idx).flatten().copied();
+                    match (min, max) {
+                        (Some(mn), Some(mx)) => parquet::file::statistics::Statistics::int64(Some(mn), Some(mx), None, Some(0), false),
+                        _ => { can_evaluate = false; break; }
+                    }
+                }
+                ColumnIndexMetaData::FLOAT(idx) => {
+                    let min = idx.min_values_iter().nth(page_idx).flatten().copied();
+                    let max = idx.max_values_iter().nth(page_idx).flatten().copied();
+                    match (min, max) {
+                        (Some(mn), Some(mx)) => parquet::file::statistics::Statistics::float(Some(mn), Some(mx), None, Some(0), false),
+                        _ => { can_evaluate = false; break; }
+                    }
+                }
+                ColumnIndexMetaData::DOUBLE(idx) => {
+                    let min = idx.min_values_iter().nth(page_idx).flatten().copied();
+                    let max = idx.max_values_iter().nth(page_idx).flatten().copied();
+                    match (min, max) {
+                        (Some(mn), Some(mx)) => parquet::file::statistics::Statistics::double(Some(mn), Some(mx), None, Some(0), false),
+                        _ => { can_evaluate = false; break; }
+                    }
+                }
+                ColumnIndexMetaData::BYTE_ARRAY(idx) => {
+                    use parquet::data_type::ByteArray;
+                    let min = idx.min_values_iter().nth(page_idx).flatten();
+                    let max = idx.max_values_iter().nth(page_idx).flatten();
+                    match (min, max) {
+                        (Some(mn), Some(mx)) => {
+                            parquet::file::statistics::Statistics::byte_array(
+                                Some(ByteArray::from(mn.to_vec())),
+                                Some(ByteArray::from(mx.to_vec())),
+                                None, Some(0), false,
+                            )
+                        }
+                        _ => { can_evaluate = false; break; }
+                    }
+                }
+                _ => { can_evaluate = false; break; }
+            };
+
+            match parquet_statistics_to_column_range_statistics(&stats, &col_descr, &daft_field.dtype) {
+                Ok(range_stats) => all_col_stats.push(range_stats),
+                Err(_) => { can_evaluate = false; break; }
+            }
+        }
+
+        if !can_evaluate || all_col_stats.iter().all(|s| matches!(s, ColumnRangeStatistics::Missing)) {
+            selectors.push(RowSelector::select(page_row_counts[page_idx]));
+            continue;
+        }
+
+        // Build TableStatistics and evaluate predicate
+        let table_stats = TableStatistics::new(all_col_stats, Arc::new(daft_schema.clone()));
+        match table_stats.eval_expression(bound_pred) {
+            Ok(ts) if ts.to_truth_value() == TruthValue::False => {
+                selectors.push(RowSelector::skip(page_row_counts[page_idx]));
+            }
+            _ => {
+                selectors.push(RowSelector::select(page_row_counts[page_idx]));
+            }
+        }
+    }
+
+    // If nothing was skipped, return None to avoid unnecessary RowSelection overhead
+    if selectors.iter().all(|s| !s.skip) {
+        return None;
+    }
+
+    Some(RowSelection::from(selectors))
+}
+
 /// Build the per-RG input bundles for the streaming decoder.
 ///
 /// Without a pushed predicate prefilter, this just forwards offset/delete/limit
@@ -366,17 +523,31 @@ async fn build_rg_inputs(
         if selected_rows_remaining == 0 {
             break;
         }
-        let total_selected = base_sel
-            .as_ref()
-            .map(|s| s.row_count())
-            .unwrap_or_else(|| metadata.row_group(rg_idx).num_rows() as usize);
+
+        // Try to refine the base selection with page-level skip
+        let page_sel = build_page_level_selection(
+            metadata,
+            rg_idx,
+            &plan.pred_col_indices,
+            arrow_schema,
+            &chunk_daft_schema,
+            &bound_pred,
+        );
+        let effective_sel = combine_selections(base_sel.clone(), page_sel);
+
+        // total_selected = number of rows that the decoder will actually output
+        // (i.e., the sum of select segments in effective_sel, not the total RG rows)
+        let total_selected = match &effective_sel {
+            Some(s) => s.iter().filter(|sel| !sel.skip).map(|sel| sel.row_count).sum(),
+            None => metadata.row_group(rg_idx).num_rows() as usize,
+        };
 
         let (mut col_receivers, _col_handles) = spawn_col_decoders(
             &plan.pred_col_indices,
             chunk_source,
             metadata,
             arrow_schema,
-            base_sel.as_ref(),
+            effective_sel.as_ref(),
             rg_idx,
             chunk_size,
             path,
@@ -446,8 +617,8 @@ async fn build_rg_inputs(
             predicate_selectors.push(RowSelector::skip(unprocessed));
         }
         let pred_sel = RowSelection::from(predicate_selectors);
-        let selection = Some(match &base_sel {
-            Some(base) => refine_selection(base, &pred_sel),
+        let selection = Some(match &effective_sel {
+            Some(eff) => refine_selection(eff, &pred_sel),
             None => pred_sel,
         });
 
@@ -587,7 +758,7 @@ pub async fn stream_parquet(
     // Single RG-level pruning pass: user row_groups + positional (start_offset,
     // num_rows) + predicate stats. Must run before `cs_builder.build`, which is
     // what spawns remote byte fetches.
-    let rg_indices = prune_row_groups(
+    let rg_indices: Vec<usize> = prune_row_groups(
         &prepared.parquet_metadata,
         opts.row_groups.as_deref(),
         opts.start_offset.unwrap_or(0),
