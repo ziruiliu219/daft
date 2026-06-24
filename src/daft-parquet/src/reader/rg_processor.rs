@@ -107,9 +107,11 @@ struct StreamingState {
     ctx: Arc<RgTaskCtx>,
     col_receivers: Vec<ColRx>,
     offset: usize,
-    /// Phase-1 predicate arrays for this RG, already mask-filtered.
+    /// Phase-1 predicate arrays for this RG (unfiltered, full rows).
     /// Indexed by `ctx.plan.pred_col_indices` position.
     filtered_pred: Vec<ArrayRef>,
+    /// Post-decode boolean mask from predicate evaluation.
+    pred_mask: Option<Arc<arrow::array::BooleanArray>>,
 }
 
 pub(super) async fn process_rg_with_data_cols(
@@ -117,6 +119,7 @@ pub(super) async fn process_rg_with_data_cols(
     rg_idx: usize,
     selection: Option<RowSelection>,
     filtered_pred: Vec<ArrayRef>,
+    pred_mask: Option<arrow::array::BooleanArray>,
 ) -> BoxStream<'static, DaftResult<RecordBatch>> {
     // Default mode invariant: data_col_indices is non-empty. PredOnly handles
     // the empty case via `process_rg_predicate_only`.
@@ -143,6 +146,7 @@ pub(super) async fn process_rg_with_data_cols(
         col_receivers,
         offset: 0,
         filtered_pred,
+        pred_mask: pred_mask.map(Arc::new),
     };
 
     let stream = futures::stream::unfold(state, |mut state| async move {
@@ -169,6 +173,26 @@ pub(super) async fn process_rg_with_data_cols(
                     .expect("col_idx must be in pred or data set");
                 arrays.push(data_chunks[dp].clone());
             }
+        }
+
+        // Apply post-decode predicate mask if present. This replaces the
+        // fragmented RowSelection that would cause expensive skip_records.
+        if let Some(mask) = &state.pred_mask {
+            let chunk_mask = mask.slice(state.offset, chunk_rows);
+            let chunk_mask_ref = chunk_mask
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .expect("mask slice is BooleanArray");
+            let filtered_arrays: Vec<ArrayRef> = match arrays
+                .iter()
+                .map(|a| arrow::compute::filter(a.as_ref(), chunk_mask_ref)
+                    .map_err(common_error::DaftError::from))
+                .collect::<DaftResult<Vec<_>>>()
+            {
+                Ok(v) => v,
+                Err(e) => return Some((Err(e), state)),
+            };
+            arrays = filtered_arrays;
         }
 
         let mut daft_batch = match record_batch_from_arrow(

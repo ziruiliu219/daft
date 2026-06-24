@@ -19,7 +19,7 @@ use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, stream::BoxStream};
 use parquet::{
-    arrow::arrow_reader::{ArrowReaderMetadata, RowSelection, RowSelector},
+    arrow::arrow_reader::{ArrowReaderMetadata, RowSelection},
     file::metadata::ParquetMetaData,
 };
 use rg_processor::{
@@ -27,15 +27,15 @@ use rg_processor::{
 };
 use snafu::ResultExt;
 use util::{
-    cap_selection_to, eval_predicate_mask, filter_arrays_by_mask, project_schema,
+    cap_selection_to, eval_predicate_mask, project_schema,
     record_batch_from_arrow, schema_from_indices, truncate_mask_to_n_trues,
 };
 
 use crate::{
     ArrowSnafu,
     helpers::{
-        bool_array_to_row_selection, build_offset_row_selection, build_single_rg_delete_selection,
-        combine_selections, predicate_pushable_cols, prune_row_groups, refine_selection,
+        build_offset_row_selection, build_single_rg_delete_selection,
+        combine_selections, predicate_pushable_cols, prune_row_groups,
         substitute_missing_cols,
     },
     metadata::{
@@ -304,14 +304,17 @@ fn apply_limit_to_selection(
 
 /// Per-RG inputs to the streaming decode pass.
 ///
-/// - `selection`: row selection to apply when decoding data columns —
-///   offset/delete-derived, refined to skip rows the predicate already rejected.
-/// - `pred_arrays`: predicate-column arrays already filtered by the predicate
-///   mask, so the main pass slices them directly without re-decoding or
-///   re-filtering. Empty when there's no predicate to prefilter.
+/// - `selection`: row selection to apply when decoding data columns.
+///   Contains only structural selections (offset/delete). Predicate filtering
+///   is handled post-decode via `pred_mask` to avoid expensive skip_records.
+/// - `pred_arrays`: predicate-column arrays (UN-filtered, same row count as
+///   data-col decode output). Empty when there's no predicate to prefilter.
+/// - `pred_mask`: boolean mask from predicate evaluation. Applied post-decode
+///   to both data columns and pred_arrays. None when there's no predicate.
 struct RgInputs {
     selection: Option<RowSelection>,
     pred_arrays: Vec<ArrayRef>,
+    pred_mask: Option<arrow::array::BooleanArray>,
 }
 
 /// Build the per-RG input bundles for the streaming decoder.
@@ -341,6 +344,7 @@ async fn build_rg_inputs(
             .map(|selection| RgInputs {
                 selection,
                 pred_arrays: Vec::new(),
+                pred_mask: None,
             })
             .collect());
     };
@@ -383,10 +387,10 @@ async fn build_rg_inputs(
         )
         .await?;
 
-        let mut predicate_selectors: Vec<RowSelector> = Vec::new();
-        let mut filtered_pred_by_col: Vec<Vec<ArrayRef>> = (0..plan.pred_col_indices.len())
+        let mut unfiltered_pred_by_col: Vec<Vec<ArrayRef>> = (0..plan.pred_col_indices.len())
             .map(|_| Vec::new())
             .collect();
+        let mut all_masks: Vec<arrow::array::BooleanArray> = Vec::new();
         let mut processed_rows = 0usize;
 
         loop {
@@ -408,11 +412,11 @@ async fn build_rg_inputs(
                 (mask, selected_rows)
             };
 
-            let filtered = filter_arrays_by_mask(&chunks, &mask, path.as_ref())?;
-            for (col_pos, filtered) in filtered.into_iter().enumerate() {
-                filtered_pred_by_col[col_pos].push(filtered);
+            // Store UNfiltered pred arrays — they align with data cols full decode.
+            for (col_pos, chunk) in chunks.into_iter().enumerate() {
+                unfiltered_pred_by_col[col_pos].push(chunk);
             }
-            predicate_selectors.extend(bool_array_to_row_selection(&mask).iter().copied());
+            all_masks.push(mask);
             processed_rows += chunk_rows;
             selected_rows_remaining -= selected_rows;
             if selected_rows_remaining == 0 {
@@ -422,15 +426,13 @@ async fn build_rg_inputs(
         // Dropping receivers closes the channels → spawned decoders abort.
         drop(col_receivers);
 
-        // Concat per-col filtered chunks into one ArrayRef per col. Zero rows
-        // processed (e.g. base_sel selected 0 rows) → empty array of the col's
-        // data type.
+        // Concat per-col unfiltered chunks into one ArrayRef per col.
         let pred_arrays: Vec<ArrayRef> = plan
             .pred_col_indices
             .iter()
             .enumerate()
             .map(|(col_pos, &col_idx)| {
-                let chunks = &filtered_pred_by_col[col_pos];
+                let chunks = &unfiltered_pred_by_col[col_pos];
                 if chunks.is_empty() {
                     arrow::array::new_empty_array(arrow_schema.field(col_idx).data_type())
                 } else {
@@ -441,19 +443,41 @@ async fn build_rg_inputs(
             })
             .collect();
 
-        let unprocessed = total_selected - processed_rows;
-        if unprocessed > 0 {
-            predicate_selectors.push(RowSelector::skip(unprocessed));
-        }
-        let pred_sel = RowSelection::from(predicate_selectors);
-        let selection = Some(match &base_sel {
-            Some(base) => refine_selection(base, &pred_sel),
-            None => pred_sel,
-        });
+        // Build the combined boolean mask. When pred cols decoded all rows,
+        // pad with false for any unprocessed remainder (shouldn't happen in
+        // normal flow but handles edge cases). When pred cols broke early
+        // (limit), NO padding — we cap data_sel to processed_rows.
+        let pred_mask = {
+            let mask_refs: Vec<&dyn arrow::array::Array> =
+                all_masks.iter().map(|a| a as &dyn arrow::array::Array).collect();
+            if mask_refs.is_empty() {
+                arrow::array::BooleanArray::from(vec![false; 0])
+            } else {
+                let concatenated = arrow::compute::concat(&mask_refs).expect("concat masks");
+                concatenated
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .expect("BooleanArray")
+                    .clone()
+            }
+        };
+
+        // Pass only the structural base_sel to data cols (no predicate-derived
+        // fragmented RowSelection). Predicate filtering via pred_mask post-decode.
+        // If pred cols broke early (limit), cap the selection so data cols only
+        // decode the same number of rows.
+        let data_sel = if processed_rows < total_selected {
+            // pred cols stopped early — cap data cols to processed_rows
+            let rg_rows = metadata.row_group(rg_idx).num_rows() as usize;
+            Some(cap_selection_to(base_sel.as_ref(), processed_rows, rg_rows))
+        } else {
+            base_sel
+        };
 
         out.push(RgInputs {
-            selection,
+            selection: data_sel,
             pred_arrays,
+            pred_mask: Some(pred_mask),
         });
     }
 
@@ -502,7 +526,7 @@ fn build_rg_stream(
                 let mut sub_stream = if ctx.plan.data_col_indices.is_empty() {
                     process_rg_predicate_only(ctx.clone(), rg_idx, inputs.selection).await
                 } else {
-                    process_rg_with_data_cols(ctx, rg_idx, inputs.selection, inputs.pred_arrays)
+                    process_rg_with_data_cols(ctx, rg_idx, inputs.selection, inputs.pred_arrays, inputs.pred_mask)
                         .await
                 };
                 while let Some(item) = sub_stream.next().await {
