@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use super::{
     RgTaskCtx,
-    chunk_source::ChunkSource,
+    chunk_source::{ChunkSource, RgReader},
     field_reader::{decode_one_streaming, leaves_for_top_fields},
     util::{
         eval_predicate_mask, filter_arrays_by_mask, project_to_schema, record_batch_from_arrow,
@@ -62,6 +62,24 @@ pub(super) async fn spawn_col_decoders(
     let all_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), col_indices).into();
     let rg_reader = chunk_source.clone().open_rg(rg_idx, all_leaves).await?;
 
+    spawn_col_decoders_with_reader(
+        col_indices, &rg_reader, metadata, arrow_schema, selection, rg_idx, chunk_size, path,
+    )
+}
+
+/// Like `spawn_col_decoders` but accepts a pre-opened `RgReader`, avoiding
+/// redundant `open_rg` calls when multiple decode passes share the same RG.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_col_decoders_with_reader(
+    col_indices: &[usize],
+    rg_reader: &RgReader,
+    metadata: &Arc<ParquetMetaData>,
+    arrow_schema: &Arc<ArrowSchema>,
+    selection: Option<&RowSelection>,
+    rg_idx: usize,
+    chunk_size: usize,
+    path: &Arc<str>,
+) -> DaftResult<(Vec<ColRx>, JoinSet<DaftResult<()>>)> {
     let compute = get_compute_runtime();
     let mut rxs = Vec::with_capacity(col_indices.len());
     let mut joinset: JoinSet<DaftResult<()>> = JoinSet::new();

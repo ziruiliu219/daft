@@ -25,6 +25,7 @@ use parquet::{
 };
 use rg_processor::{
     process_rg_predicate_only, process_rg_with_data_cols, recv_one_chunk, spawn_col_decoders,
+    spawn_col_decoders_with_reader,
 };
 use snafu::ResultExt;
 use util::{
@@ -814,14 +815,20 @@ async fn build_rg_inputs_staged(
     mut selected_rows_remaining: usize,
     path: &Arc<str>,
 ) -> DaftResult<(RgInputs, usize)> {
+    use field_reader::leaves_for_top_fields;
+
     let initial_remaining = selected_rows_remaining;
 
-    // Track the running RowSelection relative to the full RG. Starts from
-    // effective_sel (page-level + offset/delete) and gets refined each stage.
+    // Open the RG reader ONCE for all pred columns. This pre-fetches (local)
+    // or prepares lazy access (remote) for every leaf column across all stages.
+    let all_leaves: Arc<[usize]> =
+        leaves_for_top_fields(metadata.as_ref(), all_pred_col_indices).into();
+    let rg_reader = chunk_source.clone().open_rg(rg_idx, all_leaves).await?;
+
+    // Track the running RowSelection relative to the full RG.
     let mut current_sel_absolute = effective_sel.clone();
 
     // Accumulate filtered arrays per physical pred column across all stages.
-    // Index maps: physical_col_idx → position in all_pred_col_indices.
     let col_idx_to_pos: std::collections::HashMap<usize, usize> = all_pred_col_indices
         .iter()
         .enumerate()
@@ -843,23 +850,22 @@ async fn build_rg_inputs_staged(
             &stage_daft_schema,
         )?;
 
-        // Decode this stage's columns using the current (refined) selection.
         let total_selected: usize = match &current_sel_absolute {
             Some(s) => s.iter().filter(|sel| !sel.skip).map(|sel| sel.row_count).sum(),
             None => rg_rows,
         };
 
-        let (mut col_receivers, _col_handles) = spawn_col_decoders(
+        // Use the shared rg_reader — no repeated open_rg!
+        let (mut col_receivers, _col_handles) = spawn_col_decoders_with_reader(
             &stage.col_indices,
-            chunk_source,
+            &rg_reader,
             metadata,
             arrow_schema,
             current_sel_absolute.as_ref(),
             rg_idx,
             chunk_size,
             path,
-        )
-        .await?;
+        )?;
 
         let mut stage_selectors: Vec<RowSelector> = Vec::new();
         let mut stage_filtered_by_col: Vec<Vec<ArrayRef>> = (0..stage.col_indices.len())
