@@ -2,6 +2,14 @@
 harness = false
 name = "parquet_read"
 
+[[bench]]
+harness = false
+name = "pred_mask_vs_rowsel"
+
+[[bench]]
+harness = false
+name = "row_selection_skip_vs_read"
+
 [dependencies]
 arrow = {workspace = true}
 common-arrow-ffi = {path = "../common/arrow-ffi", default-features = false, optional = true}
@@ -25,6 +33,7 @@ tokio-stream = {workspace = true}
 [dev-dependencies]
 bincode = {workspace = true}
 fastrand = "2.1.0"
+libc = {workspace = true}
 parquet = {workspace = true}
 path_macro = {workspace = true}
 tango-bench.workspace = true
