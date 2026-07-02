@@ -10,6 +10,10 @@ name = "pred_mask_vs_rowsel"
 harness = false
 name = "row_selection_skip_vs_read"
 
+[[bin]]
+name = "row_selection_profile"
+path = "src/bin/row_selection_profile.rs"
+
 [dependencies]
 arrow = {workspace = true}
 common-arrow-ffi = {path = "../common/arrow-ffi", default-features = false, optional = true}
@@ -21,6 +25,7 @@ daft-dsl = {path = "../daft-dsl", default-features = false}
 daft-io = {path = "../daft-io", default-features = false}
 daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
 daft-stats = {path = "../daft-stats", default-features = false}
+fastrand = "2.1.0"
 futures = {workspace = true}
 indexmap = {workspace = true}
 parquet = {workspace = true, features = ["async", "experimental"]}

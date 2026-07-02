@@ -474,6 +474,54 @@ async fn build_rg_inputs(
             base_sel
         };
 
+        // Log pred_mask pattern for analysis.
+        {
+            let total = pred_mask.len();
+            let selected = pred_mask.true_count();
+
+            let mut runs: Vec<String> = Vec::new();
+            let mut current_val = false;
+            let mut current_count = 0usize;
+            for i in 0..total {
+                let val = pred_mask.value(i);
+                if i == 0 {
+                    current_val = val;
+                    current_count = 1;
+                } else if val == current_val {
+                    current_count += 1;
+                } else {
+                    runs.push(if current_val {
+                        format!("select({})", current_count)
+                    } else {
+                        format!("skip({})", current_count)
+                    });
+                    current_val = val;
+                    current_count = 1;
+                }
+            }
+            if current_count > 0 {
+                runs.push(if current_val {
+                    format!("select({})", current_count)
+                } else {
+                    format!("skip({})", current_count)
+                });
+            }
+
+            let num_runs = runs.len();
+            let avg_run = if num_runs > 0 { total / num_runs } else { 0 };
+            let sample: String = if runs.len() <= 20 {
+                runs.join(" ")
+            } else {
+                format!("{} ... ({} more)", runs[..20].join(" "), runs.len() - 20)
+            };
+            eprintln!(
+                "[pred_mask] rg={} total={} selected={} selectivity={:.1}% runs={} avg_run={} pattern=[{}]",
+                rg_idx, total, selected,
+                (selected as f64 / total as f64) * 100.0,
+                num_runs, avg_run, sample,
+            );
+        }
+
         out.push(RgInputs {
             selection: data_sel,
             pred_arrays,
