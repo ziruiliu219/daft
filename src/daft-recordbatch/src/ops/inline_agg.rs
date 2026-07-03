@@ -742,6 +742,225 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Multi-column composite-key packing (short keys → single integer)
+// ---------------------------------------------------------------------------
+
+/// Maximum total bytes across all group-by columns that we'll pack into a u128.
+/// Above this, we fall back to the generic hash path.
+const MAX_COMPOSITE_KEY_BYTES: usize = 16; // fits in u128
+
+/// Try to pack all group-by columns into a single u64 or u128 composite key.
+/// Works when every column is either:
+///   - A fixed-width integer (1/2/4/8 bytes)
+///   - A Utf8/Binary column where ALL values are ≤ a short fixed length
+///
+/// Returns None if packing isn't possible (variable-length strings too long, etc.)
+fn try_pack_composite_key(
+    groupby_physical: &RecordBatch,
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let cols = groupby_physical.as_materialized_series();
+    let num_rows = groupby_physical.len();
+
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    // Determine byte width for each column; bail if any column can't be packed.
+    let mut col_widths: Vec<usize> = Vec::with_capacity(cols.len());
+    let mut total_width: usize = 0;
+
+    for col in &cols {
+        let width = match col.data_type() {
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
+            DataType::Int16 | DataType::UInt16 => 2,
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
+            DataType::Utf8 => {
+                // Check max string length in this column.
+                let utf8_arr = match col.utf8() {
+                    Ok(a) => a,
+                    Err(_) => return Ok(None),
+                };
+                let arrow_arr = match utf8_arr.as_arrow() {
+                    Ok(a) => a,
+                    Err(_) => return Ok(None),
+                };
+                let offsets = arrow_arr.offsets();
+                let mut max_len: usize = 0;
+                for i in 0..num_rows {
+                    let len = (offsets[i + 1] - offsets[i]) as usize;
+                    if len > max_len {
+                        max_len = len;
+                    }
+                }
+                // We need 1 extra byte for length prefix to handle variable-length correctly.
+                // But if all strings are the same length, no prefix needed.
+                // For simplicity, allocate max_len + 1 (length byte).
+                if max_len > 8 {
+                    return Ok(None); // Too long to pack
+                }
+                max_len + 1 // 1 byte length prefix + max_len data bytes
+            }
+            DataType::Binary => {
+                let bin_arr = match col.binary() {
+                    Ok(a) => a,
+                    Err(_) => return Ok(None),
+                };
+                let arrow_arr = match bin_arr.as_arrow() {
+                    Ok(a) => a,
+                    Err(_) => return Ok(None),
+                };
+                let offsets = arrow_arr.offsets();
+                let mut max_len: usize = 0;
+                for i in 0..num_rows {
+                    let len = (offsets[i + 1] - offsets[i]) as usize;
+                    if len > max_len {
+                        max_len = len;
+                    }
+                }
+                if max_len > 8 {
+                    return Ok(None);
+                }
+                max_len + 1
+            }
+            _ => return Ok(None), // Unsupported type for packing
+        };
+        total_width += width;
+        col_widths.push(width);
+    }
+
+    if total_width > MAX_COMPOSITE_KEY_BYTES {
+        return Ok(None);
+    }
+
+    // Pack into u128 keys. Each column gets a fixed slot at a known byte offset.
+    let mut packed_keys: Vec<u128> = Vec::with_capacity(num_rows);
+    let mut byte_offsets: Vec<usize> = Vec::with_capacity(cols.len());
+    let mut offset = 0;
+    for &w in &col_widths {
+        byte_offsets.push(offset);
+        offset += w;
+    }
+
+    // Build packed key for each row.
+    for row_idx in 0..num_rows {
+        let mut key: u128 = 0;
+        for (col_idx, col) in cols.iter().enumerate() {
+            let shift = byte_offsets[col_idx] * 8;
+            match col.data_type() {
+                DataType::Int8 | DataType::UInt8 => {
+                    let val = col.u8().map_or_else(
+                        |_| col.i8().unwrap().get(row_idx).unwrap_or(0) as u8,
+                        |a| a.get(row_idx).unwrap_or(0),
+                    );
+                    key |= (val as u128) << shift;
+                }
+                DataType::Boolean => {
+                    let val = col.bool().unwrap().get(row_idx).unwrap_or(false) as u8;
+                    key |= (val as u128) << shift;
+                }
+                DataType::Int16 | DataType::UInt16 => {
+                    let val = col.u16().map_or_else(
+                        |_| col.i16().unwrap().get(row_idx).unwrap_or(0) as u16,
+                        |a| a.get(row_idx).unwrap_or(0),
+                    );
+                    key |= (val as u128) << shift;
+                }
+                DataType::Int32 | DataType::UInt32 | DataType::Float32 => {
+                    let val = if col.data_type() == &DataType::Float32 {
+                        col.f32().unwrap().get(row_idx).unwrap_or(0.0).to_bits()
+                    } else {
+                        col.u32().map_or_else(
+                            |_| col.i32().unwrap().get(row_idx).unwrap_or(0) as u32,
+                            |a| a.get(row_idx).unwrap_or(0),
+                        )
+                    };
+                    key |= (val as u128) << shift;
+                }
+                DataType::Int64 | DataType::UInt64 | DataType::Float64 => {
+                    let val = if col.data_type() == &DataType::Float64 {
+                        col.f64().unwrap().get(row_idx).unwrap_or(0.0).to_bits()
+                    } else {
+                        col.u64().map_or_else(
+                            |_| col.i64().unwrap().get(row_idx).unwrap_or(0) as u64,
+                            |a| a.get(row_idx).unwrap_or(0),
+                        )
+                    };
+                    key |= (val as u128) << shift;
+                }
+                DataType::Utf8 => {
+                    let utf8_arr = col.utf8().unwrap();
+                    let arrow_arr = utf8_arr.as_arrow().unwrap();
+                    let s = arrow_arr.value(row_idx);
+                    let bytes = s.as_bytes();
+                    let len = bytes.len() as u8;
+                    // Pack: [length_byte, data_bytes...]
+                    key |= (len as u128) << shift;
+                    for (b_idx, &b) in bytes.iter().enumerate() {
+                        key |= (b as u128) << (shift + 8 + b_idx * 8);
+                    }
+                }
+                DataType::Binary => {
+                    let bin_arr = col.binary().unwrap();
+                    let arrow_arr = bin_arr.as_arrow().unwrap();
+                    let bytes = arrow_arr.value(row_idx);
+                    let len = bytes.len() as u8;
+                    key |= (len as u128) << shift;
+                    for (b_idx, &b) in bytes.iter().enumerate() {
+                        key |= (b as u128) << (shift + 8 + b_idx * 8);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        packed_keys.push(key);
+    }
+
+    // Now use FnvHashMap on u128 (same as agg_single_col_int but for u128).
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+    let mut group_map = FnvHashMap::<u128, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &key) in packed_keys.iter().enumerate() {
+        let gid = match group_map.entry(key) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in composite-key aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
+            }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    let result = GroupingResult {
+        groupkey_indices,
+        group_ids,
+        group_sizes,
+    };
+    accumulate(accumulators, &result);
+    Ok(Some(result.groupkey_indices))
+}
+
 /// Hash-based grouping using IndexHash + comparator closure.
 /// Used when the groupby has multiple columns or non-integer types.
 fn agg_generic_hash_path(
@@ -1061,10 +1280,18 @@ impl RecordBatch {
                 None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
             }
         } else {
-            // Try symbolized path when string/binary columns are present.
-            match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+            // Try composite-key packing when all columns are small fixed-width or short strings.
+            // This packs multi-column keys into a single u64/u128 and uses the fast int path.
+            let packed_result = try_pack_composite_key(&groupby_physical, &mut accumulators)?;
+            match packed_result {
                 Some(indices) => indices,
-                None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                None => {
+                    // Try symbolized path when string/binary columns are present.
+                    match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+                        Some(indices) => indices,
+                        None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                    }
+                }
             }
         };
 
