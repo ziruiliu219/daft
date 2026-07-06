@@ -739,6 +739,188 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Columnar composite-key packing for short multi-column keys
+// ---------------------------------------------------------------------------
+
+/// Pack multiple short columns into a single u64 key using columnar (not row-by-row) access.
+///
+/// Activates when:
+/// - No column has nulls
+/// - All columns are fixed-width int (1/2/4 bytes) OR uniform-length Utf8 (all strings same len, ≤4 bytes)
+/// - Total packed width ≤ 8 bytes (fits in u64)
+///
+/// For TPC-H Q1: (returnflag CHAR(1), linestatus CHAR(1)) = 2 bytes → u64 → FnvHashMap.
+fn agg_packed_key_path(
+    groupby_physical: &RecordBatch,
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let cols = groupby_physical.as_materialized_series();
+    let num_rows = groupby_physical.len();
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    // Phase 1: Check feasibility. Collect byte width and values buffer for each column.
+    struct ColInfo {
+        width: usize,
+        bit_offset: usize,
+    }
+    let mut col_infos: Vec<ColInfo> = Vec::with_capacity(cols.len());
+    let mut total_width: usize = 0;
+
+    // We'll store references to raw data per column for the tight pack loop.
+    // Keep arrow arrays alive for the duration of this function.
+    enum ColData {
+        Int1(Vec<u8>),
+        Int2(Vec<u16>),
+        Int4(Vec<u32>),
+        Utf8Fixed { values: Vec<u8>, width: usize },
+    }
+    let mut col_datas: Vec<ColData> = Vec::with_capacity(cols.len());
+
+    for col in &cols {
+        if col.null_count() > 0 {
+            return Ok(None);
+        }
+        match col.data_type() {
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => {
+                let arr = col.u8().or_else(|_| {
+                    col.i8().map(|a| unsafe {
+                        &*(a as *const _ as *const daft_core::datatypes::UInt8Array)
+                    })
+                })?;
+                col_datas.push(ColData::Int1(arr.as_slice().to_vec()));
+                col_infos.push(ColInfo { width: 1, bit_offset: total_width * 8 });
+                total_width += 1;
+            }
+            DataType::Int16 | DataType::UInt16 => {
+                let arr = col.u16().or_else(|_| {
+                    col.i16().map(|a| unsafe {
+                        &*(a as *const _ as *const daft_core::datatypes::UInt16Array)
+                    })
+                })?;
+                col_datas.push(ColData::Int2(arr.as_slice().to_vec()));
+                col_infos.push(ColInfo { width: 2, bit_offset: total_width * 8 });
+                total_width += 2;
+            }
+            DataType::Int32 | DataType::UInt32 => {
+                let arr = col.u32().or_else(|_| {
+                    col.i32().map(|a| unsafe {
+                        &*(a as *const _ as *const daft_core::datatypes::UInt32Array)
+                    })
+                })?;
+                col_datas.push(ColData::Int4(arr.as_slice().to_vec()));
+                col_infos.push(ColInfo { width: 4, bit_offset: total_width * 8 });
+                total_width += 4;
+            }
+            DataType::Utf8 => {
+                let utf8_arr = col.utf8()?;
+                let arrow_arr = utf8_arr.as_arrow()?;
+                let offsets = arrow_arr.offsets();
+                let first_len = (offsets[1] - offsets[0]) as usize;
+                if first_len == 0 || first_len > 4 {
+                    return Ok(None);
+                }
+                for i in 1..num_rows {
+                    if (offsets[i + 1] - offsets[i]) as usize != first_len {
+                        return Ok(None);
+                    }
+                }
+                col_datas.push(ColData::Utf8Fixed {
+                    values: arrow_arr.values().to_vec(),
+                    width: first_len,
+                });
+                col_infos.push(ColInfo { width: first_len, bit_offset: total_width * 8 });
+                total_width += first_len;
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    if total_width > 8 {
+        return Ok(None);
+    }
+
+    // Phase 2: Columnar pack — process each column in a tight loop.
+    let mut packed_keys: Vec<u64> = vec![0u64; num_rows];
+
+    for (col_idx, col_data) in col_datas.iter().enumerate() {
+        let shift = col_infos[col_idx].bit_offset;
+        match col_data {
+            ColData::Int1(slice) => {
+                for (i, &v) in slice.iter().enumerate() {
+                    packed_keys[i] |= (v as u64) << shift;
+                }
+            }
+            ColData::Int2(slice) => {
+                for (i, &v) in slice.iter().enumerate() {
+                    packed_keys[i] |= (v as u64) << shift;
+                }
+            }
+            ColData::Int4(slice) => {
+                for (i, &v) in slice.iter().enumerate() {
+                    packed_keys[i] |= (v as u64) << shift;
+                }
+            }
+            ColData::Utf8Fixed { values, width } => {
+                let w = *width;
+                for i in 0..num_rows {
+                    // Direct sequential read from values buffer
+                    let start = i * w;
+                    let mut val: u64 = 0;
+                    for b in 0..w {
+                        val |= (values[start + b] as u64) << (b * 8);
+                    }
+                    packed_keys[i] |= val << shift;
+                }
+            }
+        }
+    }
+
+    // Phase 3: Group by packed u64 using FnvHashMap (same as agg_single_col_int).
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+    let mut group_map = FnvHashMap::<u64, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &key) in packed_keys.iter().enumerate() {
+        let gid = match group_map.entry(key) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in packed-key aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
+            }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    let result = GroupingResult {
+        groupkey_indices,
+        group_ids,
+        group_sizes,
+    };
+    accumulate(accumulators, &result);
+    Ok(Some(result.groupkey_indices))
+}
+
+// ---------------------------------------------------------------------------
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
@@ -1061,10 +1243,17 @@ impl RecordBatch {
                 None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
             }
         } else {
-            // Try symbolized path when string/binary columns are present.
-            match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+            // Try columnar composite-key packing for short fixed-width multi-column keys.
+            let pack_result = agg_packed_key_path(&groupby_physical, &mut accumulators)?;
+            match pack_result {
                 Some(indices) => indices,
-                None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                None => {
+                    // Try symbolized path when string/binary columns are present.
+                    match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+                        Some(indices) => indices,
+                        None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                    }
+                }
             }
         };
 
