@@ -742,8 +742,12 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
-/// Hash-based grouping using IndexHash + comparator closure.
-/// Used when the groupby has multiple columns or non-integer types.
+/// Hash-based grouping with inline comparator (no Box<dyn Fn> dispatch).
+///
+/// Replaces `build_multi_array_is_equal` (which returns a `Box<dyn Fn>` calling
+/// per-column `Box<dyn Fn>` closures) with a Vec of enum-dispatched column
+/// comparators. The enum match compiles to a jump table that the CPU can predict,
+/// and the inner comparisons are direct array indexing — no indirect function calls.
 fn agg_generic_hash_path(
     groupby_physical: &RecordBatch,
     accumulators: &mut [AggAccumulator],
@@ -751,17 +755,9 @@ fn agg_generic_hash_path(
     let num_rows = groupby_physical.len();
     let hashes = groupby_physical.hash_rows()?;
     let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
-    let cols: Vec<Series> = groupby_physical
-        .as_materialized_series()
-        .into_iter()
-        .cloned()
-        .collect();
-    let comparator = build_multi_array_is_equal(
-        cols.as_slice(),
-        cols.as_slice(),
-        vec![true; cols.len()].as_slice(),
-        vec![true; cols.len()].as_slice(),
-    )?;
+
+    // Build inline comparators for each column.
+    let col_cmps = build_inline_comparators(groupby_physical)?;
 
     let mut group_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
         initial_capacity,
@@ -773,13 +769,10 @@ fn agg_generic_hash_path(
     let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
     let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
 
-    // Phase 1: Hash probe — build dense group_ids and track group_sizes.
+    // Phase 1: Hash probe with inline comparator.
     for (row_idx, h) in hashes.values().iter().enumerate() {
         let entry = group_table.raw_entry_mut().from_hash(*h, |other| {
-            (*h == other.hash) && {
-                let j = other.idx;
-                comparator(row_idx, j as usize)
-            }
+            (*h == other.hash) && inline_rows_equal(&col_cmps, row_idx, other.idx as usize)
         });
 
         let group_id = match entry {
@@ -820,6 +813,227 @@ fn agg_generic_hash_path(
     };
     accumulate(accumulators, &result);
     Ok(result.groupkey_indices)
+}
+
+// ---------------------------------------------------------------------------
+// Inline column comparators — enum dispatch, no Box<dyn Fn>
+// ---------------------------------------------------------------------------
+
+/// Per-column comparator that stores the raw data needed to compare two rows.
+/// Each variant holds owned/cloned data so the comparator lives as long as needed.
+enum InlineColCmp {
+    /// Fixed-width: compare the raw u64 values at index i and j.
+    /// Works for i8/u8/i16/u16/i32/u32/i64/u64 by reinterpreting as u64 slices
+    /// (only the relevant bytes differ; hash already distinguishes).
+    PrimU8(Vec<u8>, Option<arrow::buffer::NullBuffer>),
+    PrimU16(Vec<u16>, Option<arrow::buffer::NullBuffer>),
+    PrimU32(Vec<u32>, Option<arrow::buffer::NullBuffer>),
+    PrimU64(Vec<u64>, Option<arrow::buffer::NullBuffer>),
+    /// Float32: compare with NaN==NaN semantics.
+    Float32(Vec<u32>, Option<arrow::buffer::NullBuffer>),
+    /// Float64: compare with NaN==NaN semantics.
+    Float64(Vec<u64>, Option<arrow::buffer::NullBuffer>),
+    /// Boolean: compare bit values.
+    Bool(arrow::array::BooleanArray),
+    /// Variable-length bytes (Utf8/Binary): compare slices via offsets+values buffer.
+    VarBytes {
+        offsets: Vec<i64>,
+        values: Vec<u8>,
+        nulls: Option<arrow::buffer::NullBuffer>,
+    },
+    /// Fallback: use the original Box<dyn Fn> comparator for unsupported types.
+    Fallback(Box<dyn Fn(usize, usize) -> bool + Send + Sync>),
+}
+
+impl InlineColCmp {
+    #[inline(always)]
+    fn eq(&self, i: usize, j: usize) -> bool {
+        match self {
+            Self::PrimU8(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::PrimU16(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::PrimU32(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::PrimU64(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::Float32(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::Float64(vals, nulls) => Self::prim_eq(vals, nulls, i, j),
+            Self::Bool(arr) => {
+                let vi = arr.is_valid(i);
+                let vj = arr.is_valid(j);
+                match (vi, vj) {
+                    (true, true) => arr.value(i) == arr.value(j),
+                    (false, false) => true, // null == null
+                    _ => false,
+                }
+            }
+            Self::VarBytes { offsets, values, nulls } => {
+                let null_i = nulls.as_ref().is_some_and(|n| !n.is_valid(i));
+                let null_j = nulls.as_ref().is_some_and(|n| !n.is_valid(j));
+                match (null_i, null_j) {
+                    (true, true) => true,
+                    (true, false) | (false, true) => false,
+                    (false, false) => {
+                        let si = offsets[i] as usize;
+                        let ei = offsets[i + 1] as usize;
+                        let sj = offsets[j] as usize;
+                        let ej = offsets[j + 1] as usize;
+                        values[si..ei] == values[sj..ej]
+                    }
+                }
+            }
+            Self::Fallback(f) => f(i, j),
+        }
+    }
+
+    #[inline(always)]
+    fn prim_eq<T: PartialEq>(vals: &[T], nulls: &Option<arrow::buffer::NullBuffer>, i: usize, j: usize) -> bool {
+        let null_i = nulls.as_ref().is_some_and(|n| !n.is_valid(i));
+        let null_j = nulls.as_ref().is_some_and(|n| !n.is_valid(j));
+        match (null_i, null_j) {
+            (true, true) => true,
+            (true, false) | (false, true) => false,
+            (false, false) => vals[i] == vals[j],
+        }
+    }
+}
+
+fn build_inline_comparators(rb: &RecordBatch) -> DaftResult<Vec<InlineColCmp>> {
+    use arrow::array::Array;
+
+    let cols = rb.as_materialized_series();
+    let num_rows = rb.len();
+    let mut cmps = Vec::with_capacity(cols.len());
+
+    for col in &cols {
+        let nulls = col.nulls().cloned();
+        let cmp = match col.data_type() {
+            DataType::Int8 | DataType::UInt8 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let vals: Vec<u8> = buf.as_slice()[data.offset()..data.offset() + num_rows].to_vec();
+                InlineColCmp::PrimU8(vals, nulls)
+            }
+            DataType::Int16 | DataType::UInt16 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let byte_offset = data.offset() * 2;
+                let byte_len = num_rows * 2;
+                let slice = &buf.as_slice()[byte_offset..byte_offset + byte_len];
+                let vals: Vec<u16> = slice.chunks_exact(2).map(|c| u16::from_ne_bytes([c[0], c[1]])).collect();
+                InlineColCmp::PrimU16(vals, nulls)
+            }
+            DataType::Int32 | DataType::UInt32 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let byte_offset = data.offset() * 4;
+                let byte_len = num_rows * 4;
+                let slice = &buf.as_slice()[byte_offset..byte_offset + byte_len];
+                let vals: Vec<u32> = slice.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+                InlineColCmp::PrimU32(vals, nulls)
+            }
+            DataType::Int64 | DataType::UInt64 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let byte_offset = data.offset() * 8;
+                let byte_len = num_rows * 8;
+                let slice = &buf.as_slice()[byte_offset..byte_offset + byte_len];
+                let vals: Vec<u64> = slice.chunks_exact(8).map(|c| u64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
+                InlineColCmp::PrimU64(vals, nulls)
+            }
+            DataType::Float32 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let byte_offset = data.offset() * 4;
+                let byte_len = num_rows * 4;
+                let slice = &buf.as_slice()[byte_offset..byte_offset + byte_len];
+                let vals: Vec<u32> = slice.chunks_exact(4).map(|c| {
+                    let bits = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+                    // Canonicalize NaN: all NaN payloads map to canonical NaN bits
+                    if f32::from_bits(bits).is_nan() { f32::NAN.to_bits() } else { bits }
+                }).collect();
+                InlineColCmp::Float32(vals, nulls)
+            }
+            DataType::Float64 => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = &data.buffers()[0];
+                let byte_offset = data.offset() * 8;
+                let byte_len = num_rows * 8;
+                let slice = &buf.as_slice()[byte_offset..byte_offset + byte_len];
+                let vals: Vec<u64> = slice.chunks_exact(8).map(|c| {
+                    let bits = u64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                    if f64::from_bits(bits).is_nan() { f64::NAN.to_bits() } else { bits }
+                }).collect();
+                InlineColCmp::Float64(vals, nulls)
+            }
+            DataType::Boolean => {
+                let arrow_arr = col.to_arrow()?;
+                let bool_arr = arrow_arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap()
+                    .clone();
+                InlineColCmp::Bool(bool_arr)
+            }
+            DataType::Utf8 => {
+                let arrow_arr = col.to_arrow()?;
+                // Daft Utf8 maps to arrow LargeUtf8 (i64 offsets)
+                if let Some(large) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let offsets: Vec<i64> = large.offsets().iter().copied().collect();
+                    let values: Vec<u8> = large.values().to_vec();
+                    InlineColCmp::VarBytes { offsets, values, nulls }
+                } else if let Some(small) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let offsets: Vec<i64> = small.offsets().iter().map(|&o| o as i64).collect();
+                    let values: Vec<u8> = small.values().to_vec();
+                    InlineColCmp::VarBytes { offsets, values, nulls }
+                } else {
+                    // Fallback
+                    let cmp_fn = daft_core::array::ops::arrow::comparison::build_is_equal(
+                        arrow_arr.as_ref(), arrow_arr.as_ref(), true, true,
+                    )?;
+                    InlineColCmp::Fallback(cmp_fn)
+                }
+            }
+            DataType::Binary => {
+                let arrow_arr = col.to_arrow()?;
+                if let Some(large) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeBinaryArray>() {
+                    let offsets: Vec<i64> = large.offsets().iter().copied().collect();
+                    let values: Vec<u8> = large.values().to_vec();
+                    InlineColCmp::VarBytes { offsets, values, nulls }
+                } else if let Some(small) = arrow_arr.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                    let offsets: Vec<i64> = small.offsets().iter().map(|&o| o as i64).collect();
+                    let values: Vec<u8> = small.values().to_vec();
+                    InlineColCmp::VarBytes { offsets, values, nulls }
+                } else {
+                    let cmp_fn = daft_core::array::ops::arrow::comparison::build_is_equal(
+                        arrow_arr.as_ref(), arrow_arr.as_ref(), true, true,
+                    )?;
+                    InlineColCmp::Fallback(cmp_fn)
+                }
+            }
+            _ => {
+                // Fallback to Box<dyn Fn> for types we don't specialize.
+                let arrow_arr = col.to_arrow()?;
+                let cmp_fn = daft_core::array::ops::arrow::comparison::build_is_equal(
+                    arrow_arr.as_ref(),
+                    arrow_arr.as_ref(),
+                    true,
+                    true,
+                )?;
+                InlineColCmp::Fallback(cmp_fn)
+            }
+        };
+        cmps.push(cmp);
+    }
+    Ok(cmps)
+}
+
+#[inline(always)]
+fn inline_rows_equal(cmps: &[InlineColCmp], i: usize, j: usize) -> bool {
+    cmps.iter().all(|c| c.eq(i, j))
 }
 
 // ---------------------------------------------------------------------------
