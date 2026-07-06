@@ -742,94 +742,116 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
-/// Hash-based grouping — optimized to avoid per-row comparator calls.
+/// Hash-based grouping using row-oriented key encoding.
 ///
-/// Uses hash-only grouping (treating each distinct hash as a distinct group),
-/// which eliminates the expensive `comparator(i, j)` indirect call from the
-/// hot loop. After grouping, a lightweight validation pass confirms no hash
-/// collisions occurred. If a collision is detected (probability ~10^-12 for
-/// xxhash3-64 with <2^32 rows), falls back to the full comparator path.
+/// Converts group-by columns into a row-oriented byte format using arrow's
+/// `RowConverter`. This gives us:
+///   - One contiguous byte slice per row (cache-friendly)
+///   - Fast hashing: hash the byte slice directly (no per-column hash + combine)
+///   - Fast comparison: byte-slice equality (memcmp, no indirect calls)
+///   - 100% correct: no probabilistic assumptions
 ///
-/// This is universally applicable — no restrictions on key types, column count,
-/// or string lengths.
+/// This replaces both `hash_rows()` + `build_multi_array_is_equal()` with a
+/// single pass that's more CPU-cache-friendly.
 fn agg_generic_hash_path(
     groupby_physical: &RecordBatch,
     accumulators: &mut [AggAccumulator],
 ) -> DaftResult<Vec<u64>> {
+    use arrow::row::{RowConverter, SortField};
+    use std::hash::Hasher;
+
     let num_rows = groupby_physical.len();
-    let hashes = groupby_physical.hash_rows()?;
     let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
 
-    // --- Fast path: hash-only grouping (no comparator in hot loop) ---
-    let mut group_table = FnvHashMap::<u64, u32>::with_capacity_and_hasher(
+    // Convert group-by columns to arrow arrays for RowConverter.
+    let cols: Vec<Series> = groupby_physical
+        .as_materialized_series()
+        .into_iter()
+        .cloned()
+        .collect();
+    let arrow_arrays: Vec<arrow::array::ArrayRef> = cols
+        .iter()
+        .map(|s| s.to_arrow())
+        .collect::<DaftResult<Vec<_>>>()?;
+
+    // Build sort fields (ascending, nulls last — order doesn't matter for equality,
+    // just needs to be consistent).
+    let sort_fields: Vec<SortField> = arrow_arrays
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+
+    let converter = RowConverter::new(sort_fields).map_err(|e| {
+        common_error::DaftError::ComputeError(format!("RowConverter creation failed: {e}"))
+    })?;
+    let rows = converter.convert_columns(&arrow_arrays).map_err(|e| {
+        common_error::DaftError::ComputeError(format!("RowConverter conversion failed: {e}"))
+    })?;
+
+    // Grouping: hash table maps hash → (group_id, representative_row_idx).
+    // We use a Vec for group representatives and a FnvHashMap<u64, u32> for
+    // hash → group_id lookup, then verify equality against the representative.
+    let mut hash_to_gid = FnvHashMap::<u64, Vec<u32>>::with_capacity_and_hasher(
         initial_capacity,
         BuildHasherDefault::default(),
     );
     let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut group_reps: Vec<usize> = Vec::with_capacity(initial_capacity); // rep row idx per group
     let mut num_groups: u32 = 0;
     let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
     let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
 
-    for (row_idx, &h) in hashes.values().iter().enumerate() {
-        let gid = match group_table.entry(h) {
-            Vacant(e) => {
+    for row_idx in 0..num_rows {
+        let row_bytes = rows.row(row_idx);
+
+        // Hash the row bytes using FNV.
+        let mut hasher = fnv::FnvHasher::default();
+        hasher.write(row_bytes.as_ref());
+        let h = hasher.finish();
+
+        // Look up by hash, then compare row bytes for equality.
+        let gid = if let Some(candidates) = hash_to_gid.get(&h) {
+            // Find matching group among candidates with the same hash.
+            let mut found_gid = None;
+            for &candidate_gid in candidates {
+                let rep_row = group_reps[candidate_gid as usize];
+                if rows.row(rep_row) == row_bytes {
+                    found_gid = Some(candidate_gid);
+                    break;
+                }
+            }
+            if let Some(gid) = found_gid {
+                group_sizes[gid as usize] += 1;
+                gid
+            } else {
+                // Hash collision: same hash but different key — new group.
                 let gid = num_groups;
                 num_groups = num_groups.checked_add(1).ok_or_else(|| {
                     common_error::DaftError::ComputeError(
                         "Number of groups exceeds u32::MAX in inline aggregation".into(),
                     )
                 })?;
-                e.insert(gid);
+                hash_to_gid.get_mut(&h).unwrap().push(gid);
+                group_reps.push(row_idx);
                 groupkey_indices.push(row_idx as u64);
                 group_sizes.push(1);
                 gid
             }
-            Occupied(e) => {
-                let gid = *e.get();
-                group_sizes[gid as usize] += 1;
-                gid
-            }
+        } else {
+            // New hash — new group.
+            let gid = num_groups;
+            num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                common_error::DaftError::ComputeError(
+                    "Number of groups exceeds u32::MAX in inline aggregation".into(),
+                )
+            })?;
+            hash_to_gid.insert(h, vec![gid]);
+            group_reps.push(row_idx);
+            groupkey_indices.push(row_idx as u64);
+            group_sizes.push(1);
+            gid
         };
         group_ids.push(gid);
-    }
-
-    // --- Validation: detect hash collisions ---
-    // For each group with ≥2 members, verify one non-representative member
-    // actually equals the representative. This is O(num_groups) comparator calls,
-    // not O(num_rows).
-    if num_groups > 1 {
-        let cols: Vec<Series> = groupby_physical
-            .as_materialized_series()
-            .into_iter()
-            .cloned()
-            .collect();
-        let comparator = build_multi_array_is_equal(
-            cols.as_slice(),
-            cols.as_slice(),
-            vec![true; cols.len()].as_slice(),
-            vec![true; cols.len()].as_slice(),
-        )?;
-
-        let mut validated = vec![false; num_groups as usize];
-        let mut collision = false;
-        for (row_idx, &gid) in group_ids.iter().enumerate() {
-            let rep = groupkey_indices[gid as usize] as usize;
-            if row_idx != rep && !validated[gid as usize] {
-                validated[gid as usize] = true;
-                if !comparator(row_idx, rep) {
-                    collision = true;
-                    break;
-                }
-            }
-            if validated.iter().all(|&v| v) {
-                break;
-            }
-        }
-
-        if collision {
-            // Extremely rare fallback — re-do with full comparator.
-            return agg_generic_hash_path_safe(groupby_physical, accumulators);
-        }
     }
 
     let result = GroupingResult {
