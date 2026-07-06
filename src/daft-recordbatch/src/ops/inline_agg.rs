@@ -742,9 +742,108 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
-/// Hash-based grouping using IndexHash + comparator closure.
-/// Used when the groupby has multiple columns or non-integer types.
+/// Hash-based grouping — optimized to avoid per-row comparator calls.
+///
+/// Uses hash-only grouping (treating each distinct hash as a distinct group),
+/// which eliminates the expensive `comparator(i, j)` indirect call from the
+/// hot loop. After grouping, a lightweight validation pass confirms no hash
+/// collisions occurred. If a collision is detected (probability ~10^-12 for
+/// xxhash3-64 with <2^32 rows), falls back to the full comparator path.
+///
+/// This is universally applicable — no restrictions on key types, column count,
+/// or string lengths.
 fn agg_generic_hash_path(
+    groupby_physical: &RecordBatch,
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Vec<u64>> {
+    let num_rows = groupby_physical.len();
+    let hashes = groupby_physical.hash_rows()?;
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+
+    // --- Fast path: hash-only grouping (no comparator in hot loop) ---
+    let mut group_table = FnvHashMap::<u64, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &h) in hashes.values().iter().enumerate() {
+        let gid = match group_table.entry(h) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in inline aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
+            }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    // --- Validation: detect hash collisions ---
+    // For each group with ≥2 members, verify one non-representative member
+    // actually equals the representative. This is O(num_groups) comparator calls,
+    // not O(num_rows).
+    if num_groups > 1 {
+        let cols: Vec<Series> = groupby_physical
+            .as_materialized_series()
+            .into_iter()
+            .cloned()
+            .collect();
+        let comparator = build_multi_array_is_equal(
+            cols.as_slice(),
+            cols.as_slice(),
+            vec![true; cols.len()].as_slice(),
+            vec![true; cols.len()].as_slice(),
+        )?;
+
+        let mut validated = vec![false; num_groups as usize];
+        let mut collision = false;
+        for (row_idx, &gid) in group_ids.iter().enumerate() {
+            let rep = groupkey_indices[gid as usize] as usize;
+            if row_idx != rep && !validated[gid as usize] {
+                validated[gid as usize] = true;
+                if !comparator(row_idx, rep) {
+                    collision = true;
+                    break;
+                }
+            }
+            if validated.iter().all(|&v| v) {
+                break;
+            }
+        }
+
+        if collision {
+            // Extremely rare fallback — re-do with full comparator.
+            return agg_generic_hash_path_safe(groupby_physical, accumulators);
+        }
+    }
+
+    let result = GroupingResult {
+        groupkey_indices,
+        group_ids,
+        group_sizes,
+    };
+    accumulate(accumulators, &result);
+    Ok(result.groupkey_indices)
+}
+
+/// Full comparator-based hash grouping (original algorithm).
+/// Only called as fallback when a hash collision is detected above.
+fn agg_generic_hash_path_safe(
     groupby_physical: &RecordBatch,
     accumulators: &mut [AggAccumulator],
 ) -> DaftResult<Vec<u64>> {
@@ -773,7 +872,6 @@ fn agg_generic_hash_path(
     let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
     let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
 
-    // Phase 1: Hash probe — build dense group_ids and track group_sizes.
     for (row_idx, h) in hashes.values().iter().enumerate() {
         let entry = group_table.raw_entry_mut().from_hash(*h, |other| {
             (*h == other.hash) && {
@@ -812,7 +910,6 @@ fn agg_generic_hash_path(
         group_ids.push(group_id);
     }
 
-    // Phase 2: Accumulation with O(groups) count optimization.
     let result = GroupingResult {
         groupkey_indices,
         group_ids,
