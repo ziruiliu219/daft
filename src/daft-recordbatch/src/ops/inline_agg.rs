@@ -742,26 +742,41 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
-/// Hash-based grouping using IndexHash + comparator closure.
-/// Used when the groupby has multiple columns or non-integer types.
+/// Hash-based grouping: uses hash_rows() for hashing (unchanged) but replaces
+/// the `build_multi_array_is_equal` comparator with row-format byte comparison
+/// via arrow's RowConverter. This eliminates per-row indirect function calls
+/// and random arrow array accesses during equality checks.
 fn agg_generic_hash_path(
     groupby_physical: &RecordBatch,
     accumulators: &mut [AggAccumulator],
 ) -> DaftResult<Vec<u64>> {
+    use arrow::row::{RowConverter, SortField};
+
     let num_rows = groupby_physical.len();
     let hashes = groupby_physical.hash_rows()?;
     let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+
+    // Convert group-by columns to row format for fast byte-equality comparison.
     let cols: Vec<Series> = groupby_physical
         .as_materialized_series()
         .into_iter()
         .cloned()
         .collect();
-    let comparator = build_multi_array_is_equal(
-        cols.as_slice(),
-        cols.as_slice(),
-        vec![true; cols.len()].as_slice(),
-        vec![true; cols.len()].as_slice(),
-    )?;
+    let arrow_arrays: Vec<arrow::array::ArrayRef> = cols
+        .iter()
+        .map(|s| s.to_arrow())
+        .collect::<DaftResult<Vec<_>>>()?;
+    let sort_fields: Vec<SortField> = arrow_arrays
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+
+    let converter = RowConverter::new(sort_fields).map_err(|e| {
+        common_error::DaftError::ComputeError(format!("RowConverter creation failed: {e}"))
+    })?;
+    let rows = converter.convert_columns(&arrow_arrays).map_err(|e| {
+        common_error::DaftError::ComputeError(format!("RowConverter conversion failed: {e}"))
+    })?;
 
     let mut group_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
         initial_capacity,
@@ -773,13 +788,10 @@ fn agg_generic_hash_path(
     let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
     let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
 
-    // Phase 1: Hash probe — build dense group_ids and track group_sizes.
+    // Phase 1: Hash probe with row-format comparison.
     for (row_idx, h) in hashes.values().iter().enumerate() {
         let entry = group_table.raw_entry_mut().from_hash(*h, |other| {
-            (*h == other.hash) && {
-                let j = other.idx;
-                comparator(row_idx, j as usize)
-            }
+            (*h == other.hash) && (rows.row(row_idx) == rows.row(other.idx as usize))
         });
 
         let group_id = match entry {
