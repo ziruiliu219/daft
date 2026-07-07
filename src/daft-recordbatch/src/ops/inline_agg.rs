@@ -743,10 +743,19 @@ where
 // Columnar composite-key packing (u128, expanded type support)
 // ---------------------------------------------------------------------------
 
-/// Maximum total bytes that can be packed into a u128.
+/// Maximum total bytes that can be packed.
 const MAX_PACK_BYTES: usize = 16;
 
-/// Pack multiple columns into a single u128 key using columnar access.
+struct PackColPlan {
+    bit_offset: usize,
+}
+
+enum PackColKind {
+    Fixed(usize),
+    Utf8 { max_len: usize },
+}
+
+/// Pack multiple columns into a single u64 or u128 key using columnar access.
 ///
 /// Activates when:
 /// - No column has nulls
@@ -767,29 +776,19 @@ fn agg_packed_key_path(
     }
 
     // Phase 1: Check feasibility + determine byte layout.
-    struct ColPlan {
-        bit_offset: usize,
-        width: usize,
-    }
-    let mut plans: Vec<ColPlan> = Vec::with_capacity(cols.len());
+    let mut plans: Vec<PackColPlan> = Vec::with_capacity(cols.len());
     let mut total_width: usize = 0;
-
-    // Track which columns are Utf8 with their max_len (for Phase 2 packing).
-    enum ColKind {
-        Fixed(usize),          // byte width
-        Utf8 { max_len: usize }, // max string length in this batch
-    }
-    let mut col_kinds: Vec<ColKind> = Vec::with_capacity(cols.len());
+    let mut col_kinds: Vec<PackColKind> = Vec::with_capacity(cols.len());
 
     for col in &cols {
         if col.null_count() > 0 {
             return Ok(None);
         }
         let (width, kind) = match col.data_type() {
-            DataType::Int8 | DataType::UInt8 | DataType::Boolean => (1, ColKind::Fixed(1)),
-            DataType::Int16 | DataType::UInt16 => (2, ColKind::Fixed(2)),
-            DataType::Int32 | DataType::UInt32 | DataType::Float32 => (4, ColKind::Fixed(4)),
-            DataType::Int64 | DataType::UInt64 | DataType::Float64 => (8, ColKind::Fixed(8)),
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => (1, PackColKind::Fixed(1)),
+            DataType::Int16 | DataType::UInt16 => (2, PackColKind::Fixed(2)),
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => (4, PackColKind::Fixed(4)),
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 => (8, PackColKind::Fixed(8)),
             DataType::Utf8 => {
                 // Check max string length in this batch.
                 let arrow_arr = col.to_arrow()?;
@@ -806,11 +805,11 @@ fn agg_packed_key_path(
                     return Ok(None); // Too long (1 byte len prefix + 15 bytes max)
                 }
                 let packed_width = 1 + max_len; // length prefix + padded data
-                (packed_width, ColKind::Utf8 { max_len })
+                (packed_width, PackColKind::Utf8 { max_len })
             }
             _ => return Ok(None),
         };
-        plans.push(ColPlan { bit_offset: total_width * 8, width });
+        plans.push(PackColPlan { bit_offset: total_width * 8 });
         total_width += width;
         col_kinds.push(kind);
     }
@@ -819,92 +818,74 @@ fn agg_packed_key_path(
         return Ok(None);
     }
 
-    // Phase 2: Columnar pack into u128.
-    let mut packed_keys: Vec<u128> = vec![0u128; num_rows];
+    // Phase 2+3: Pack and group. Choose u64 or u128 based on total_width.
+    if total_width <= 8 {
+        pack_and_group_u64(num_rows, &cols, &plans, &col_kinds, accumulators)
+    } else {
+        pack_and_group_u128(num_rows, &cols, &plans, &col_kinds, accumulators)
+    }
+}
 
-    for (col_idx, col) in cols.iter().enumerate() {
-        let shift = plans[col_idx].bit_offset;
-        match &col_kinds[col_idx] {
-            ColKind::Fixed(1) => {
-                let arrow_arr = col.to_arrow()?;
-                let data = arrow_arr.to_data();
-                let buf = data.buffers()[0].as_slice();
-                let off = data.offset();
-                for i in 0..num_rows {
-                    packed_keys[i] |= (buf[off + i] as u128) << shift;
-                }
+/// Pack into u64 keys and group (for total_width ≤ 8).
+fn pack_and_group_u64(
+    num_rows: usize,
+    cols: &[&Series],
+    plans: &[PackColPlan],
+    col_kinds: &[PackColKind],
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let mut packed_keys: Vec<u64> = vec![0u64; num_rows];
+    pack_columns_into(&mut packed_keys, num_rows, cols, plans, col_kinds)?;
+
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+    let mut group_map = FnvHashMap::<u64, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &key) in packed_keys.iter().enumerate() {
+        let gid = match group_map.entry(key) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in packed-key aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
             }
-            ColKind::Fixed(2) => {
-                let arrow_arr = col.to_arrow()?;
-                let data = arrow_arr.to_data();
-                let buf = data.buffers()[0].as_slice();
-                let base = data.offset() * 2;
-                for i in 0..num_rows {
-                    let b = &buf[base + i * 2..base + i * 2 + 2];
-                    let val = u16::from_ne_bytes([b[0], b[1]]);
-                    packed_keys[i] |= (val as u128) << shift;
-                }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
             }
-            ColKind::Fixed(4) => {
-                let arrow_arr = col.to_arrow()?;
-                let data = arrow_arr.to_data();
-                let buf = data.buffers()[0].as_slice();
-                let base = data.offset() * 4;
-                for i in 0..num_rows {
-                    let b = &buf[base + i * 4..base + i * 4 + 4];
-                    let val = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
-                    packed_keys[i] |= (val as u128) << shift;
-                }
-            }
-            ColKind::Fixed(8) => {
-                let arrow_arr = col.to_arrow()?;
-                let data = arrow_arr.to_data();
-                let buf = data.buffers()[0].as_slice();
-                let base = data.offset() * 8;
-                for i in 0..num_rows {
-                    let b = &buf[base + i * 8..base + i * 8 + 8];
-                    let val = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-                    packed_keys[i] |= (val as u128) << shift;
-                }
-            }
-            ColKind::Utf8 { max_len } => {
-                let arrow_arr = col.to_arrow()?;
-                let ml = *max_len;
-                if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
-                    let values = a.values();
-                    let offsets = a.offsets();
-                    for i in 0..num_rows {
-                        let start = offsets[i] as usize;
-                        let end = offsets[i + 1] as usize;
-                        let len = end - start;
-                        // Pack: [length_byte, data_bytes padded to max_len]
-                        let mut val: u128 = len as u128;
-                        for (b_idx, &b) in values[start..end].iter().enumerate() {
-                            val |= (b as u128) << ((1 + b_idx) * 8);
-                        }
-                        // Remaining bytes stay 0 (padding)
-                        packed_keys[i] |= val << shift;
-                    }
-                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
-                    let values = a.values();
-                    let offsets = a.offsets();
-                    for i in 0..num_rows {
-                        let start = offsets[i] as usize;
-                        let end = offsets[i + 1] as usize;
-                        let len = end - start;
-                        let mut val: u128 = len as u128;
-                        for (b_idx, &b) in values[start..end].iter().enumerate() {
-                            val |= (b as u128) << ((1 + b_idx) * 8);
-                        }
-                        packed_keys[i] |= val << shift;
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
+        };
+        group_ids.push(gid);
     }
 
-    // Phase 3: Group by packed u128 using FnvHashMap.
+    let result = GroupingResult { groupkey_indices, group_ids, group_sizes };
+    accumulate(accumulators, &result);
+    Ok(Some(result.groupkey_indices))
+}
+
+/// Pack into u128 keys and group (for total_width 9-16).
+fn pack_and_group_u128(
+    num_rows: usize,
+    cols: &[&Series],
+    plans: &[PackColPlan],
+    col_kinds: &[PackColKind],
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let mut packed_keys: Vec<u128> = vec![0u128; num_rows];
+    pack_columns_into(&mut packed_keys, num_rows, cols, plans, col_kinds)?;
+
     let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
     let mut group_map = FnvHashMap::<u128, u32>::with_capacity_and_hasher(
         initial_capacity,
@@ -938,13 +919,118 @@ fn agg_packed_key_path(
         group_ids.push(gid);
     }
 
-    let result = GroupingResult {
-        groupkey_indices,
-        group_ids,
-        group_sizes,
-    };
+    let result = GroupingResult { groupkey_indices, group_ids, group_sizes };
     accumulate(accumulators, &result);
     Ok(Some(result.groupkey_indices))
+}
+
+/// Trait to abstract over u64/u128 for the pack loop.
+trait PackTarget: Default + Copy {
+    fn from_byte(b: u8, shift: usize) -> Self;
+    fn bitor_assign(&mut self, other: Self);
+}
+
+impl PackTarget for u64 {
+    #[inline(always)]
+    fn from_byte(b: u8, shift: usize) -> Self { (b as u64) << shift }
+    #[inline(always)]
+    fn bitor_assign(&mut self, other: Self) { *self |= other; }
+}
+
+impl PackTarget for u128 {
+    #[inline(always)]
+    fn from_byte(b: u8, shift: usize) -> Self { (b as u128) << shift }
+    #[inline(always)]
+    fn bitor_assign(&mut self, other: Self) { *self |= other; }
+}
+
+/// Columnar pack loop — generic over u64/u128.
+fn pack_columns_into<T: PackTarget>(
+    packed_keys: &mut [T],
+    num_rows: usize,
+    cols: &[&Series],
+    plans: &[PackColPlan],
+    col_kinds: &[PackColKind],
+) -> DaftResult<()> {
+    for (col_idx, col) in cols.iter().enumerate() {
+        let shift = plans[col_idx].bit_offset;
+        match &col_kinds[col_idx] {
+            PackColKind::Fixed(1) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let off = data.offset();
+                for i in 0..num_rows {
+                    packed_keys[i].bitor_assign(T::from_byte(buf[off + i], shift));
+                }
+            }
+            PackColKind::Fixed(2) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 2;
+                for i in 0..num_rows {
+                    let s = base + i * 2;
+                    packed_keys[i].bitor_assign(T::from_byte(buf[s], shift));
+                    packed_keys[i].bitor_assign(T::from_byte(buf[s + 1], shift + 8));
+                }
+            }
+            PackColKind::Fixed(4) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 4;
+                for i in 0..num_rows {
+                    let s = base + i * 4;
+                    for b in 0..4 {
+                        packed_keys[i].bitor_assign(T::from_byte(buf[s + b], shift + b * 8));
+                    }
+                }
+            }
+            PackColKind::Fixed(8) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 8;
+                for i in 0..num_rows {
+                    let s = base + i * 8;
+                    for b in 0..8 {
+                        packed_keys[i].bitor_assign(T::from_byte(buf[s + b], shift + b * 8));
+                    }
+                }
+            }
+            PackColKind::Utf8 { max_len: _ } => {
+                let arrow_arr = col.to_arrow()?;
+                if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        let len = end - start;
+                        packed_keys[i].bitor_assign(T::from_byte(len as u8, shift));
+                        for (b_idx, &b) in values[start..end].iter().enumerate() {
+                            packed_keys[i].bitor_assign(T::from_byte(b, shift + (1 + b_idx) * 8));
+                        }
+                    }
+                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        let len = end - start;
+                        packed_keys[i].bitor_assign(T::from_byte(len as u8, shift));
+                        for (b_idx, &b) in values[start..end].iter().enumerate() {
+                            packed_keys[i].bitor_assign(T::from_byte(b, shift + (1 + b_idx) * 8));
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
