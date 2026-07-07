@@ -765,6 +765,7 @@ enum PackColKind {
 ///
 /// Covers: TPC-H Q1 (char(1)×2=2B), Q3/Q10 group-by patterns,
 /// and any multi-column key with short fixed-width types.
+#[inline(never)]
 fn agg_packed_key_path(
     groupby_physical: &RecordBatch,
     accumulators: &mut [AggAccumulator],
@@ -827,6 +828,7 @@ fn agg_packed_key_path(
 }
 
 /// Pack into u64 keys and group (for total_width ≤ 8).
+#[inline(never)]
 fn pack_and_group_u64(
     num_rows: usize,
     cols: &[&Series],
@@ -876,6 +878,7 @@ fn pack_and_group_u64(
 }
 
 /// Pack into u128 keys and group (for total_width 9-16).
+#[inline(never)]
 fn pack_and_group_u128(
     num_rows: usize,
     cols: &[&Series],
@@ -945,6 +948,7 @@ impl PackTarget for u128 {
 }
 
 /// Columnar pack loop — generic over u64/u128.
+#[inline(never)]
 fn pack_columns_into<T: PackTarget>(
     packed_keys: &mut [T],
     num_rows: usize,
