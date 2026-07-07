@@ -739,6 +739,215 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Columnar composite-key packing (u128, expanded type support)
+// ---------------------------------------------------------------------------
+
+/// Maximum total bytes that can be packed into a u128.
+const MAX_PACK_BYTES: usize = 16;
+
+/// Pack multiple columns into a single u128 key using columnar access.
+///
+/// Activates when:
+/// - No column has nulls
+/// - All columns are: int8-64, uint8-64, float32/64, bool,
+///   OR Utf8 where max string length in this batch + 1 (length prefix) fits
+/// - Total packed width ≤ 16 bytes
+///
+/// Covers: TPC-H Q1 (char(1)×2=2B), Q3/Q10 group-by patterns,
+/// and any multi-column key with short fixed-width types.
+fn agg_packed_key_path(
+    groupby_physical: &RecordBatch,
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let cols = groupby_physical.as_materialized_series();
+    let num_rows = groupby_physical.len();
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    // Phase 1: Check feasibility + determine byte layout.
+    struct ColPlan {
+        bit_offset: usize,
+        width: usize,
+    }
+    let mut plans: Vec<ColPlan> = Vec::with_capacity(cols.len());
+    let mut total_width: usize = 0;
+
+    // Track which columns are Utf8 with their max_len (for Phase 2 packing).
+    enum ColKind {
+        Fixed(usize),          // byte width
+        Utf8 { max_len: usize }, // max string length in this batch
+    }
+    let mut col_kinds: Vec<ColKind> = Vec::with_capacity(cols.len());
+
+    for col in &cols {
+        if col.null_count() > 0 {
+            return Ok(None);
+        }
+        let (width, kind) = match col.data_type() {
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => (1, ColKind::Fixed(1)),
+            DataType::Int16 | DataType::UInt16 => (2, ColKind::Fixed(2)),
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => (4, ColKind::Fixed(4)),
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 => (8, ColKind::Fixed(8)),
+            DataType::Utf8 => {
+                // Check max string length in this batch.
+                let arrow_arr = col.to_arrow()?;
+                let max_len = if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let offsets = a.offsets();
+                    (0..num_rows).map(|i| (offsets[i + 1] - offsets[i]) as usize).max().unwrap_or(0)
+                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let offsets = a.offsets();
+                    (0..num_rows).map(|i| (offsets[i + 1] - offsets[i]) as usize).max().unwrap_or(0)
+                } else {
+                    return Ok(None);
+                };
+                if max_len > 15 {
+                    return Ok(None); // Too long (1 byte len prefix + 15 bytes max)
+                }
+                let packed_width = 1 + max_len; // length prefix + padded data
+                (packed_width, ColKind::Utf8 { max_len })
+            }
+            _ => return Ok(None),
+        };
+        plans.push(ColPlan { bit_offset: total_width * 8, width });
+        total_width += width;
+        col_kinds.push(kind);
+    }
+
+    if total_width > MAX_PACK_BYTES {
+        return Ok(None);
+    }
+
+    // Phase 2: Columnar pack into u128.
+    let mut packed_keys: Vec<u128> = vec![0u128; num_rows];
+
+    for (col_idx, col) in cols.iter().enumerate() {
+        let shift = plans[col_idx].bit_offset;
+        match &col_kinds[col_idx] {
+            ColKind::Fixed(1) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let off = data.offset();
+                for i in 0..num_rows {
+                    packed_keys[i] |= (buf[off + i] as u128) << shift;
+                }
+            }
+            ColKind::Fixed(2) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 2;
+                for i in 0..num_rows {
+                    let b = &buf[base + i * 2..base + i * 2 + 2];
+                    let val = u16::from_ne_bytes([b[0], b[1]]);
+                    packed_keys[i] |= (val as u128) << shift;
+                }
+            }
+            ColKind::Fixed(4) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 4;
+                for i in 0..num_rows {
+                    let b = &buf[base + i * 4..base + i * 4 + 4];
+                    let val = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                    packed_keys[i] |= (val as u128) << shift;
+                }
+            }
+            ColKind::Fixed(8) => {
+                let arrow_arr = col.to_arrow()?;
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 8;
+                for i in 0..num_rows {
+                    let b = &buf[base + i * 8..base + i * 8 + 8];
+                    let val = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                    packed_keys[i] |= (val as u128) << shift;
+                }
+            }
+            ColKind::Utf8 { max_len } => {
+                let arrow_arr = col.to_arrow()?;
+                let ml = *max_len;
+                if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        let len = end - start;
+                        // Pack: [length_byte, data_bytes padded to max_len]
+                        let mut val: u128 = len as u128;
+                        for (b_idx, &b) in values[start..end].iter().enumerate() {
+                            val |= (b as u128) << ((1 + b_idx) * 8);
+                        }
+                        // Remaining bytes stay 0 (padding)
+                        packed_keys[i] |= val << shift;
+                    }
+                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        let len = end - start;
+                        let mut val: u128 = len as u128;
+                        for (b_idx, &b) in values[start..end].iter().enumerate() {
+                            val |= (b as u128) << ((1 + b_idx) * 8);
+                        }
+                        packed_keys[i] |= val << shift;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Phase 3: Group by packed u128 using FnvHashMap.
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+    let mut group_map = FnvHashMap::<u128, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &key) in packed_keys.iter().enumerate() {
+        let gid = match group_map.entry(key) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in packed-key aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
+            }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    let result = GroupingResult {
+        groupkey_indices,
+        group_ids,
+        group_sizes,
+    };
+    accumulate(accumulators, &result);
+    Ok(Some(result.groupkey_indices))
+}
+
+// ---------------------------------------------------------------------------
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
@@ -1061,10 +1270,17 @@ impl RecordBatch {
                 None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
             }
         } else {
-            // Try symbolized path when string/binary columns are present.
-            match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+            // Try columnar composite-key packing (u128) for short fixed-width multi-column keys.
+            let pack_result = agg_packed_key_path(&groupby_physical, &mut accumulators)?;
+            match pack_result {
                 Some(indices) => indices,
-                None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                None => {
+                    // Try symbolized path when string/binary columns are present.
+                    match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+                        Some(indices) => indices,
+                        None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                    }
+                }
             }
         };
 
