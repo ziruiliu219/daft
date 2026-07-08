@@ -742,6 +742,216 @@ where
 // Generic multi-column hash path
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Packed-key fast path (u64): supports null + variable-length strings
+// ---------------------------------------------------------------------------
+
+/// Pack multi-column keys into u64. Supports:
+/// - All fixed-width types (int8-64, uint8-64, float32/64, bool)
+/// - Variable-length Utf8 (max_len in this batch + 1 len byte must fit)
+/// - Nullable columns (1 byte null flag per column)
+/// Total packed width must be ≤ 8 bytes.
+#[inline(never)]
+fn agg_packed_key_path(
+    groupby_physical: &RecordBatch,
+    accumulators: &mut [AggAccumulator],
+) -> DaftResult<Option<Vec<u64>>> {
+    let cols = groupby_physical.as_materialized_series();
+    let num_rows = groupby_physical.len();
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    // Phase 1: determine layout.
+    // Each column gets: [null_flag (1 byte if nullable)] + [data bytes]
+    let mut total_width: usize = 0;
+    struct ColLayout {
+        bit_offset: usize,
+        data_width: usize,
+        has_null: bool,
+    }
+    let mut layouts: Vec<ColLayout> = Vec::with_capacity(cols.len());
+
+    for col in &cols {
+        let has_null = col.null_count() > 0;
+        let null_overhead = if has_null { 1 } else { 0 };
+        let data_width = match col.data_type() {
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
+            DataType::Int16 | DataType::UInt16 => 2,
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
+            DataType::Utf8 => {
+                // Find max string length in this batch
+                let arrow_arr = col.to_arrow()?;
+                let max_len = if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let offsets = a.offsets();
+                    (0..num_rows).map(|i| (offsets[i + 1] - offsets[i]) as usize).max().unwrap_or(0)
+                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let offsets = a.offsets();
+                    (0..num_rows).map(|i| (offsets[i + 1] - offsets[i]) as usize).max().unwrap_or(0)
+                } else {
+                    return Ok(None);
+                };
+                // 1 byte length prefix + max_len data bytes
+                1 + max_len
+            }
+            _ => return Ok(None),
+        };
+        let col_width = null_overhead + data_width;
+        layouts.push(ColLayout {
+            bit_offset: total_width * 8,
+            data_width,
+            has_null,
+        });
+        total_width += col_width;
+    }
+
+    if total_width > 8 {
+        return Ok(None);
+    }
+
+    // Phase 2: columnar pack into u64
+    let mut packed_keys: Vec<u64> = vec![0u64; num_rows];
+
+    for (col_idx, col) in cols.iter().enumerate() {
+        let layout = &layouts[col_idx];
+        let base_shift = layout.bit_offset;
+        let null_flag_shift = base_shift;
+        let data_shift = if layout.has_null { base_shift + 8 } else { base_shift };
+
+        let arrow_arr = col.to_arrow()?;
+        let nulls = col.nulls();
+
+        // Write null flags
+        if layout.has_null {
+            for i in 0..num_rows {
+                let valid = nulls.map_or(true, |n| n.is_valid(i));
+                if valid {
+                    packed_keys[i] |= 1u64 << null_flag_shift; // 1 = valid
+                }
+                // 0 = null (default from vec![0; ...])
+            }
+        }
+
+        // Write data bytes
+        match col.data_type() {
+            DataType::Int8 | DataType::UInt8 | DataType::Boolean => {
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let off = data.offset();
+                for i in 0..num_rows {
+                    if nulls.map_or(true, |n| n.is_valid(i)) {
+                        packed_keys[i] |= (buf[off + i] as u64) << data_shift;
+                    }
+                }
+            }
+            DataType::Int16 | DataType::UInt16 => {
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 2;
+                for i in 0..num_rows {
+                    if nulls.map_or(true, |n| n.is_valid(i)) {
+                        let s = base + i * 2;
+                        packed_keys[i] |= (buf[s] as u64) << data_shift;
+                        packed_keys[i] |= (buf[s + 1] as u64) << (data_shift + 8);
+                    }
+                }
+            }
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => {
+                let data = arrow_arr.to_data();
+                let buf = data.buffers()[0].as_slice();
+                let base = data.offset() * 4;
+                for i in 0..num_rows {
+                    if nulls.map_or(true, |n| n.is_valid(i)) {
+                        let s = base + i * 4;
+                        for b in 0..4 {
+                            packed_keys[i] |= (buf[s + b] as u64) << (data_shift + b * 8);
+                        }
+                    }
+                }
+            }
+            DataType::Utf8 => {
+                if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        if nulls.map_or(true, |n| n.is_valid(i)) {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let len = end - start;
+                            // Pack: [len_byte, data_bytes...]
+                            packed_keys[i] |= (len as u64) << data_shift;
+                            for (b_idx, &b) in values[start..end].iter().enumerate() {
+                                packed_keys[i] |= (b as u64) << (data_shift + (1 + b_idx) * 8);
+                            }
+                        }
+                    }
+                } else if let Some(a) = arrow_arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    let values = a.values();
+                    let offsets = a.offsets();
+                    for i in 0..num_rows {
+                        if nulls.map_or(true, |n| n.is_valid(i)) {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let len = end - start;
+                            packed_keys[i] |= (len as u64) << data_shift;
+                            for (b_idx, &b) in values[start..end].iter().enumerate() {
+                                packed_keys[i] |= (b as u64) << (data_shift + (1 + b_idx) * 8);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Phase 3: group by packed u64
+    let initial_capacity = std::cmp::min(num_rows, 1024).max(1);
+    let mut group_map = FnvHashMap::<u64, u32>::with_capacity_and_hasher(
+        initial_capacity,
+        BuildHasherDefault::default(),
+    );
+    let mut groupkey_indices: Vec<u64> = Vec::with_capacity(initial_capacity);
+    let mut num_groups: u32 = 0;
+    let mut group_ids: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut group_sizes: Vec<u64> = Vec::with_capacity(initial_capacity);
+
+    for (row_idx, &key) in packed_keys.iter().enumerate() {
+        let gid = match group_map.entry(key) {
+            Vacant(e) => {
+                let gid = num_groups;
+                num_groups = num_groups.checked_add(1).ok_or_else(|| {
+                    common_error::DaftError::ComputeError(
+                        "Number of groups exceeds u32::MAX in packed-key aggregation".into(),
+                    )
+                })?;
+                e.insert(gid);
+                groupkey_indices.push(row_idx as u64);
+                group_sizes.push(1);
+                gid
+            }
+            Occupied(e) => {
+                let gid = *e.get();
+                group_sizes[gid as usize] += 1;
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    let result = GroupingResult {
+        groupkey_indices,
+        group_ids,
+        group_sizes,
+    };
+    accumulate(accumulators, &result);
+    Ok(Some(result.groupkey_indices))
+}
+
+// ---------------------------------------------------------------------------
+// Generic multi-column hash path
+// ---------------------------------------------------------------------------
+
 /// Hash-based grouping using IndexHash + comparator closure.
 /// Used when the groupby has multiple columns or non-integer types.
 fn agg_generic_hash_path(
@@ -1061,10 +1271,17 @@ impl RecordBatch {
                 None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
             }
         } else {
-            // Try symbolized path when string/binary columns are present.
-            match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+            // Try packed-key fast path first (u64, supports null + variable-length strings).
+            let pack_result = agg_packed_key_path(&groupby_physical, &mut accumulators)?;
+            match pack_result {
                 Some(indices) => indices,
-                None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                None => {
+                    // Try symbolized path when string/binary columns are present.
+                    match agg_symbolized_path(&groupby_physical, &mut accumulators)? {
+                        Some(indices) => indices,
+                        None => agg_generic_hash_path(&groupby_physical, &mut accumulators)?,
+                    }
+                }
             }
         };
 
