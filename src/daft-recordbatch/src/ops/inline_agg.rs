@@ -762,6 +762,11 @@ fn agg_packed_key_path(
         return Ok(None);
     }
 
+    eprintln!("[pack] called: num_rows={}, num_cols={}, dtypes={:?}",
+        num_rows, cols.len(),
+        cols.iter().map(|c| format!("{}", c.data_type())).collect::<Vec<_>>()
+    );
+
     // Phase 1: determine layout.
     // Each column gets: [null_flag (1 byte if nullable)] + [data bytes]
     let mut total_width: usize = 0;
