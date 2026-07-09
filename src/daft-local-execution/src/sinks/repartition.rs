@@ -69,7 +69,12 @@ impl RepartitionAccState {
         let pre_repartitioned = std::mem::take(&mut self.pre_repartitioned);
         self.pre_repartitioned_size_bytes = 0;
 
-        let concated = RecordBatch::concat(pre_repartitioned)?;
+        // Avoid concat overhead when there's only a single batch (common with large morsels).
+        let concated = if pre_repartitioned.len() == 1 {
+            pre_repartitioned.into_iter().next().unwrap()
+        } else {
+            RecordBatch::concat(pre_repartitioned)?
+        };
         let num_partitions = self.num_partitions();
 
         let partitioned = match &self.repartition_spec {
@@ -236,18 +241,44 @@ impl BlockingSink for RepartitionSink {
                     states
                         .iter_mut()
                         .try_for_each(RepartitionAccState::flush_pre_partitioned)?;
-                    let (per_partition, input_id) =
-                        flatten_per_partition(states, num_partitions, schema.clone())?;
 
                     match backend {
                         RepartitionBackend::Ray => {
+                            let input_id = states
+                                .first()
+                                .map(|s| s.input_id)
+                                .expect("RepartitionSink::finalize called with no states");
+                            debug_assert!(states.iter().all(|s| s.input_id == input_id));
+                            debug_assert!(
+                                states
+                                    .iter()
+                                    .all(|s| s.post_repartitioned.len() == num_partitions)
+                            );
+
+                            // Directly collect and concat raw RecordBatch chunks per partition,
+                            // avoiding the intermediate MicroPartition wrapper + second concat.
                             let mut joinset = OrderedJoinSet::new();
-                            for data in per_partition {
+                            for partition_idx in 0..num_partitions {
+                                let chunks: Vec<RecordBatch> = states
+                                    .iter_mut()
+                                    .flat_map(|state| {
+                                        std::mem::take(
+                                            &mut state.post_repartitioned[partition_idx],
+                                        )
+                                    })
+                                    .collect();
+                                let schema = schema.clone();
                                 joinset.spawn(async move {
-                                    let concated_rb = data.concat_or_get()?;
+                                    let rb = if chunks.is_empty() {
+                                        vec![]
+                                    } else if chunks.len() == 1 {
+                                        chunks
+                                    } else {
+                                        vec![RecordBatch::concat(chunks)?]
+                                    };
                                     let mp = MicroPartition::new_loaded(
-                                        data.schema(),
-                                        Arc::new(concated_rb.into_iter().collect()),
+                                        schema,
+                                        Arc::new(rb),
                                         None,
                                     );
                                     Ok::<_, DaftError>(mp)
@@ -266,6 +297,9 @@ impl BlockingSink for RepartitionSink {
                             shuffle_address,
                             compression,
                         } => {
+                            let (per_partition, input_id) =
+                                flatten_per_partition(states, num_partitions, schema.clone())?;
+
                             let partition_caches = write_partitions_one_shot(
                                 input_id,
                                 shuffle_id,

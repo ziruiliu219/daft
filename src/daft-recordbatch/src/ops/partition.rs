@@ -21,8 +21,6 @@ impl RecordBatch {
                 targets.len()
             )));
         }
-        let mut output_to_input_idx =
-            vec![Vec::with_capacity(self.len() / num_partitions); num_partitions];
         if targets.null_count() != 0 {
             return Err(DaftError::ComputeError(format!(
                 "target array can not contain nulls, contains {} nulls",
@@ -30,22 +28,53 @@ impl RecordBatch {
             )));
         }
 
-        for (s_idx, t_idx) in targets.values().iter().enumerate() {
-            if *t_idx >= (num_partitions as u64) {
+        let num_rows = self.len();
+
+        // --- Phase 1: Count rows per partition (one pass over targets) ---
+        let mut counts = vec![0usize; num_partitions];
+        for &t_idx in targets.values().iter() {
+            let p = t_idx as usize;
+            if p >= num_partitions {
                 return Err(DaftError::ComputeError(format!(
-                    "idx in target array is out of bounds, target idx {t_idx} at index {s_idx} out of {num_partitions} partitions"
+                    "idx in target array is out of bounds, target idx {t_idx} out of {num_partitions} partitions"
                 )));
             }
-
-            output_to_input_idx[*t_idx as usize].push(s_idx as u64);
+            counts[p] += 1;
         }
-        output_to_input_idx
-            .into_iter()
-            .map(|v| {
-                let indices = UInt64Array::from_vec("idx", v);
-                self.take(&indices)
+
+        // --- Phase 2: Build a single permutation array ---
+        // Compute the starting offset of each partition in the permutation.
+        let mut offsets = Vec::with_capacity(num_partitions + 1);
+        offsets.push(0usize);
+        for &c in &counts {
+            offsets.push(offsets.last().unwrap() + c);
+        }
+
+        // Scatter source indices into the permutation array at their
+        // partition's current write position.
+        let mut write_pos = offsets[..num_partitions].to_vec();
+        let mut permutation = vec![0u64; num_rows];
+        for (s_idx, &t_idx) in targets.values().iter().enumerate() {
+            let p = t_idx as usize;
+            permutation[write_pos[p]] = s_idx as u64;
+            write_pos[p] += 1;
+        }
+
+        // --- Phase 3: Single gather + slice ---
+        // Perform one `take` per column using the full permutation, then
+        // slice into per-partition RecordBatches (zero-copy on the arrow level).
+        let perm_indices = UInt64Array::from_vec("idx", permutation);
+        let gathered = self.take(&perm_indices)?;
+
+        let result = (0..num_partitions)
+            .map(|p| {
+                let start = offsets[p];
+                let len = counts[p];
+                gathered.slice(start, start + len)
             })
-            .collect::<DaftResult<Vec<_>>>()
+            .collect::<DaftResult<Vec<_>>>()?;
+
+        Ok(result)
     }
 
     pub fn partition_by_hash(
