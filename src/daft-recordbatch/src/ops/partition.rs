@@ -21,8 +21,6 @@ impl RecordBatch {
                 targets.len()
             )));
         }
-        let mut output_to_input_idx =
-            vec![Vec::with_capacity(self.len() / num_partitions); num_partitions];
         if targets.null_count() != 0 {
             return Err(DaftError::ComputeError(format!(
                 "target array can not contain nulls, contains {} nulls",
@@ -30,15 +28,38 @@ impl RecordBatch {
             )));
         }
 
-        for (s_idx, t_idx) in targets.values().iter().enumerate() {
-            if *t_idx >= (num_partitions as u64) {
+        // Count rows per partition first for exact allocation (avoids realloc on skew).
+        let mut counts = vec![0usize; num_partitions];
+        for &t_idx in targets.values().iter() {
+            let p = t_idx as usize;
+            if p >= num_partitions {
                 return Err(DaftError::ComputeError(format!(
-                    "idx in target array is out of bounds, target idx {t_idx} at index {s_idx} out of {num_partitions} partitions"
+                    "idx in target array is out of bounds, target idx {t_idx} out of {num_partitions} partitions"
                 )));
             }
-
-            output_to_input_idx[*t_idx as usize].push(s_idx as u64);
+            counts[p] += 1;
         }
+
+        // Fast path: if all rows belong to a single partition, skip take entirely.
+        let num_rows = self.len();
+        let single_partition = counts.iter().position(|&c| c == num_rows);
+        if let Some(p) = single_partition {
+            let mut result = (0..num_partitions)
+                .map(|_| self.slice(0, 0))
+                .collect::<DaftResult<Vec<_>>>()?;
+            result[p] = self.clone();
+            return Ok(result);
+        }
+
+        let mut output_to_input_idx: Vec<Vec<u64>> = counts
+            .iter()
+            .map(|&c| Vec::with_capacity(c))
+            .collect();
+
+        for (s_idx, &t_idx) in targets.values().iter().enumerate() {
+            output_to_input_idx[t_idx as usize].push(s_idx as u64);
+        }
+
         output_to_input_idx
             .into_iter()
             .map(|v| {
