@@ -21,6 +21,7 @@ use taper_hashmap::chunk::SlotValue;
 use taper_hashmap::row_container::RowContainer;
 use taper_hashmap::taper_hashmap::TaperHashMap;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+use arrow::array::Int64Array as ArrowInt64Array;
 
 // ═══════════════════════════════════════════════════════════════════
 // Daft infra
@@ -66,8 +67,10 @@ fn hash_combine(seed: u64, val: i64) -> u64 {
 
 /// Precomputed benchmark data for a given key type configuration.
 struct BenchData {
-    /// All key columns concatenated as i64 arrays (even i32 stored as i64 for simplicity).
+    /// Key columns as i64 Vecs (used by Taper side for RowContainer writes).
     keys: Vec<Vec<i64>>,
+    /// Key columns as Arrow Int64Array (used by Daft side for comparator).
+    arrow_keys: Vec<ArrowInt64Array>,
     hashes: Vec<u64>,
     values: Vec<i64>,
     num_cols: usize,
@@ -173,7 +176,8 @@ fn generate_data(
     all_values.extend_from_slice(&probe_values);
 
     BenchData {
-        keys: all_cols,
+        keys: all_cols.clone(),
+        arrow_keys: all_cols.iter().map(|col| ArrowInt64Array::from(col.clone())).collect(),
         hashes: all_hashes,
         values: all_values,
         num_cols,
@@ -269,8 +273,10 @@ fn run_daft(data: &BenchData, ht_size: usize) {
                 return false;
             }
             let j = other.idx as usize;
+            // Use Arrow Int64Array::value() — identical to Daft's comparator
+            // which calls arrow array.value(i) == array.value(j)
             for c in 0..num_cols {
-                if data.keys[c][i] != data.keys[c][j] {
+                if data.arrow_keys[c].value(i) != data.arrow_keys[c].value(j) {
                     return false;
                 }
             }

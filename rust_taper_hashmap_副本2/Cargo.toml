@@ -12,6 +12,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 hashbrown = "0.16"
 rand = "0.9"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+arrow = { version = "54", default-features = false, features = ["ffi"] }
 
 [[bench]]
 name = "hashmap_bench"
