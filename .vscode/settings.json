@@ -4,6 +4,30 @@
   },
   "rust-analyzer.check.features": "all",
   "rust-analyzer.cargo.features": "all",
+  // 加速索引: 用 clippy 替代 check 可以获得更多诊断但更慢
+  // 如果索引太慢可以改回 "check"
+  "rust-analyzer.check.command": "check",
+  // 使用 toolchain 自带的 rust-analyzer（解决版本不兼容）
+  "rust-analyzer.server.path": "rust-analyzer",
+  // 启用 proc-macro 支持 (对理解 macro 展开后的代码有帮助)
+  "rust-analyzer.procMacro.enable": true,
+  // 索引时包含所有 target (不只当前平台)
+  "rust-analyzer.cargo.target": null,
+  // 启用 inlay hints 看类型推导
+  "rust-analyzer.inlayHints.typeHints.enable": true,
+  "rust-analyzer.inlayHints.parameterHints.enable": true,
+  // 搜索范围: 包含依赖的符号 (方便跳转到 arrow-rs 等)
+  "rust-analyzer.workspace.symbol.search.scope": "workspace_and_dependencies",
+  // 文件排除: 加速索引
+  "search.exclude": {
+    "**/target": true,
+    "**/.venv": true,
+    "**/node_modules": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.venv/**": true
+  },
   "python.testing.pytestArgs": [
     "tests"
   ],

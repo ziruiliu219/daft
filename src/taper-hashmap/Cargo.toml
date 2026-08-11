@@ -1,0 +1,17 @@
+[package]
+name = "taper-hashmap"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+hashbrown = "0.16"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.9"
+
+[[bench]]
+name = "hashmap_bench"
+harness = false
